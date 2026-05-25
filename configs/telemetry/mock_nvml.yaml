@@ -1,0 +1,12 @@
+sampler: mock_nvml
+interval_ms: 1000
+metrics:
+  - timestamp_s
+  - gpu_index
+  - power_watts
+  - temperature_c
+  - sm_clock_mhz
+  - memory_clock_mhz
+  - utilization_gpu_pct
+  - utilization_memory_pct
+

@@ -1,0 +1,46 @@
+case_id: PWR-IDLE-001
+feature_name: SOC idle baseline
+case_name: Driver initialized idle baseline
+title: Driver initialized idle baseline
+category: idle
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Target GPU is visible to the NVIDIA driver on the H100/B200 server.
+  - No user workload is running on the selected GPU.
+  - Persistence mode and power policy are configured by lab procedure.
+workload:
+  type: command
+  executable: python
+  args: [workloads/python/idle_sleep.py, --seconds, "60"]
+parameters:
+  warmup_sec: 10
+  steady_sec: 60
+  sweep: []
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 1000
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - temperature_c
+    - sm_clock_mhz
+    - memory_clock_mhz
+    - utilization_gpu_pct
+    - utilization_memory_pct
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Establish idle board power after driver initialization.
+  key_metrics: [avg_power_watts, p95_power_watts, temperature_c]
+  pass_criteria:
+    - GPU utilization remains near zero during the steady window.
+    - Power is stable enough to use as a baseline for deltas.
+notes:
+  - Dry-run uses a sleep placeholder; no GPU access is attempted locally.
+

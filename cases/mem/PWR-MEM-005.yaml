@@ -1,0 +1,59 @@
+case_id: PWR-MEM-005
+feature_name: MEM/SOC subsystem
+case_name: TMA versus normal copy comparison
+title: TMA versus normal copy comparison
+category: mem
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - TMA and normal copy implementations are built from the same source revision.
+  - Problem shape and data type are held constant across mechanisms.
+workload:
+  type: command
+  executable: ./build/workloads/tma_copy
+  args:
+    - --device
+    - "0"
+    - --direction
+    - gm_to_smem
+    - --mechanism
+    - "{mechanism}"
+    - --bytes
+    - "16777216"
+    - --warmup-sec
+    - "10"
+    - --steady-sec
+    - "60"
+parameters:
+  warmup_sec: 10
+  steady_sec: 60
+  sweep:
+    mechanism:
+      - {label: normal_copy, value: normal}
+      - {label: tma, value: tma}
+    direction: gm_to_smem
+    block_size: 16MB
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_gpu_pct
+    - utilization_memory_pct
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Compare power and throughput for TMA and normal copy mechanisms.
+  key_metrics: [avg_power_watts_by_mechanism, throughput_gbps_by_mechanism]
+  pass_criteria:
+    - Both mechanisms use the same data volume and steady interval.
+    - Result summary reports power-per-throughput comparison.
+notes:
+  - TMA path is build-time guarded; unsupported builds report fallback_used in JSON.
+  - Compare normal and requested TMA paths only after confirming tma_supported on the target build.

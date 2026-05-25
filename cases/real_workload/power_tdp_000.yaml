@@ -1,0 +1,60 @@
+case_id: power_tdp_000
+feature_name: real_workload
+case_name: Real workload TDP power test for H100/B200
+title: Real workload TDP power test for H100/B200
+category: real_workload
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Representative AI workload container or script is available on the target server.
+  - Model, batch size, precision, and dataset source are recorded.
+workload:
+  type: command
+  executable: python
+  args:
+    - workloads/python/real_workload_stub.py
+    - --mode
+    - tdp_matmul
+    - --device
+    - "0"
+    - --dtype
+    - bf16
+    - --matrix-size
+    - "8192"
+    - --warmup-sec
+    - "30"
+    - --steady-sec
+    - "300"
+parameters:
+  warmup_sec: 30
+  steady_sec: 300
+  sweep:
+    workload_profile: tdp_target
+    default_stub: torch_cuda_matmul
+    precision: bf16
+    matrix_size: 8192
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 1000
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - temperature_c
+    - utilization_gpu_pct
+    - utilization_memory_pct
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Adapt a representative TDP-oriented real workload to H100/B200.
+  key_metrics: [avg_power_watts, p95_power_watts, workload_throughput]
+  pass_criteria:
+    - Workload maintains target utilization during the steady window.
+    - Power summary is complete and traceable to workload configuration.
+notes:
+  - Uses the torch CUDA matmul stub by default; replace the workload command with a model, vLLM, cuDNN frontend, or custom command on the target server.
+  - The stub exits with a JSON error if PyTorch CUDA is unavailable.

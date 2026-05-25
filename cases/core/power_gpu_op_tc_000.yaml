@@ -1,0 +1,74 @@
+case_id: power_gpu_op_tc_000
+feature_name: AI Core / Tensor Core
+case_name: Tensor Core GEMM power versus time duty cycle
+title: Tensor Core GEMM power versus time duty cycle
+category: core
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Tensor Core GEMM workload is built on the target H100/B200 server.
+  - Matrix shapes and data types are recorded with the result.
+workload:
+  type: command
+  executable: ./build/workloads/tensor_core_burn
+  args:
+    - --device
+    - "0"
+    - --dtype
+    - bf16
+    - --m
+    - "8192"
+    - --n
+    - "8192"
+    - --k
+    - "8192"
+    - --duty-cycle
+    - "{duty_cycle}"
+    - --active-sm-fraction
+    - "1.0"
+    - --warmup-sec
+    - "30"
+    - --steady-sec
+    - "60"
+parameters:
+  warmup_sec: 30
+  steady_sec: 60
+  sweep:
+    duty_cycle:
+      - {label: "0pct", value: "0.0"}
+      - {label: "10pct", value: "0.1"}
+      - {label: "20pct", value: "0.2"}
+      - {label: "30pct", value: "0.3"}
+      - {label: "40pct", value: "0.4"}
+      - {label: "50pct", value: "0.5"}
+      - {label: "60pct", value: "0.6"}
+      - {label: "70pct", value: "0.7"}
+      - {label: "80pct", value: "0.8"}
+      - {label: "90pct", value: "0.9"}
+      - {label: "100pct", value: "1.0"}
+    op: tensor_core_gemm
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_gpu_pct
+    - sm_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Sweep Tensor Core GEMM duty cycle from 0% to 100% in 10% steps.
+  key_metrics: [avg_power_watts_by_duty_cycle, tensor_active_pct]
+  pass_criteria:
+    - Power increases with higher duty cycle unless capped by clocks or thermals.
+    - All duty-cycle points produce complete telemetry.
+notes:
+  - Uses cuBLAS BF16 GEMM as the initial Tensor Core burn path.
+  - CUTLASS integration is optional and reserved for a later step.
+  - Dry-run records command generation only.

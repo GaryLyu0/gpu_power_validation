@@ -1,0 +1,58 @@
+case_id: PWR-MEM-002
+feature_name: IO subsystem
+case_name: D2D GM-to-GM copy bandwidth-power test
+title: D2D GM-to-GM copy bandwidth-power test
+category: io
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Device memory capacity is sufficient for the largest block-size sweep.
+  - Target GPU is not shared with other workloads.
+workload:
+  type: command
+  executable: ./build/workloads/h2d_d2d_copy
+  args:
+    - --device
+    - "0"
+    - --mode
+    - d2d
+    - --bytes
+    - "268435456"
+    - --warmup-sec
+    - "10"
+    - --steady-sec
+    - "60"
+    - --presweep-bytes
+    - "4096,65536,1048576,16777216,268435456"
+parameters:
+  warmup_sec: 10
+  steady_sec: 60
+  sweep:
+    presweep_block_sizes: [4KB, 64KB, 1MB, 16MB, 256MB]
+    selected_block_size: 256MB
+    direction: D2D
+    path: global_memory_to_global_memory
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_memory_pct
+    - memory_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Pre-sweep D2D copy sizes and measure GM-to-GM copy power at saturation.
+  key_metrics: [avg_power_watts, d2d_bandwidth_gbps, selected_block_size]
+  pass_criteria:
+    - D2D bandwidth reaches a stable plateau for the selected block size.
+    - Power samples cover the full steady interval.
+notes:
+  - Primary workload is the independent CUDA microbenchmark under workloads/cuda_microbench.
+  - nvbandwidth may be used separately as a cross-check, but this case does not depend on third_party.

@@ -1,0 +1,56 @@
+case_id: PWR-MEM-004
+feature_name: MEM/SOC subsystem
+case_name: TMA copy direction power test
+title: TMA copy direction power test
+category: mem
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Target compiler and CUDA toolkit support TMA kernels for the selected GPU.
+  - Shared-memory configuration is recorded.
+workload:
+  type: command
+  executable: ./build/workloads/tma_copy
+  args:
+    - --device
+    - "0"
+    - --direction
+    - "{direction}"
+    - --mechanism
+    - tma
+    - --bytes
+    - "16777216"
+    - --warmup-sec
+    - "10"
+    - --steady-sec
+    - "60"
+parameters:
+  warmup_sec: 10
+  steady_sec: 60
+  sweep:
+    direction: [gm_to_smem, smem_to_gm]
+    mechanism: tma
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - sm_clock_mhz
+    - memory_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Compare TMA copy power for GM-to-SMEM and SMEM-to-GM directions.
+  key_metrics: [avg_power_watts_by_direction, throughput_gbps]
+  pass_criteria:
+    - Both TMA directions run with complete telemetry on target hardware.
+    - Directional power deltas are reported.
+notes:
+  - TMA path is build-time guarded; unsupported builds report fallback_used in JSON.
+  - Fallback uses a normal shared-memory staged copy and does not claim true TMA behavior.

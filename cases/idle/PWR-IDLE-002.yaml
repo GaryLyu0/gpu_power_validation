@@ -1,0 +1,44 @@
+case_id: PWR-IDLE-002
+feature_name: SOC idle baseline
+case_name: Clock-locked idle baseline
+title: Clock-locked idle baseline
+category: idle
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Target server supports application clock or equivalent clock-lock control.
+  - No user workload is running on the selected GPU.
+workload:
+  type: command
+  executable: python
+  args: [workloads/python/idle_sleep.py, --seconds, "60"]
+parameters:
+  warmup_sec: 10
+  steady_sec: 60
+  sweep:
+    sm_clock_mhz: [900, 1200, 1410]
+clock_control:
+  enabled: true
+  mode: fixed
+  sm_clock_mhz: 1410
+  mem_clock_mhz: null
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 1000
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - sm_clock_mhz
+    - memory_clock_mhz
+    - utilization_gpu_pct
+expected:
+  summary: Measure idle power sensitivity under representative locked SM clocks.
+  key_metrics: [avg_power_watts, sm_clock_mhz, memory_clock_mhz]
+  pass_criteria:
+    - Clock lock intent is recorded in the result summary.
+    - No workload execution occurs in dry-run mode.
+notes:
+  - Real clock control must be enabled only on the target H100/B200 server.
+

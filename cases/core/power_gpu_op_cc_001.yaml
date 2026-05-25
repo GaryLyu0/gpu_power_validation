@@ -1,0 +1,67 @@
+case_id: power_gpu_op_cc_001
+feature_name: CUDA Core
+case_name: Integer and logical elementwise power versus time duty cycle
+title: Integer and logical elementwise power versus time duty cycle
+category: core
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - CUDA Core integer/logical workload is built on the target server.
+  - Operand mix is recorded with result metadata.
+workload:
+  type: command
+  executable: ./build/workloads/cuda_core_burn
+  args:
+    - --device
+    - "0"
+    - --mode
+    - int32_logic
+    - --duty-cycle
+    - "{duty_cycle}"
+    - --buffer-mb
+    - "1024"
+    - --warmup-sec
+    - "30"
+    - --steady-sec
+    - "60"
+parameters:
+  warmup_sec: 30
+  steady_sec: 60
+  sweep:
+    duty_cycle:
+      - {label: "0pct", value: "0.0"}
+      - {label: "10pct", value: "0.1"}
+      - {label: "20pct", value: "0.2"}
+      - {label: "30pct", value: "0.3"}
+      - {label: "40pct", value: "0.4"}
+      - {label: "50pct", value: "0.5"}
+      - {label: "60pct", value: "0.6"}
+      - {label: "70pct", value: "0.7"}
+      - {label: "80pct", value: "0.8"}
+      - {label: "90pct", value: "0.9"}
+      - {label: "100pct", value: "1.0"}
+    op: cuda_core_integer_logical_elementwise
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_gpu_pct
+    - sm_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Sweep CUDA Core integer/logical elementwise duty cycle.
+  key_metrics: [avg_power_watts_by_duty_cycle, integer_active_pct]
+  pass_criteria:
+    - All duty-cycle points complete on the target server.
+    - Result distinguishes integer/logical activity from FP activity.
+notes:
+  - Uses the independent CUDA Core burn microbenchmark; build and run on H100/B200.
+  - Local dry-run validates metadata and command generation only.

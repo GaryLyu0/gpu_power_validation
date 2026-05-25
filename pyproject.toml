@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-power-validation"
+version = "0.1.0"
+description = "Config-driven GPU power validation framework skeleton for NVIDIA H100/B200."
+requires-python = ">=3.9"
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "pynvml>=11.5",
+]
+test = [
+  "pytest>=7.0",
+]
+
+[tool.setuptools]
+packages = [
+  "runner",
+  "workloads",
+  "workloads.python",
+  "workloads.third_party_wrappers",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

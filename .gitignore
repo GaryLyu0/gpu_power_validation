@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Local editor / OS state
+.vscode/
+.idea/
+.vs/
+.DS_Store
+Thumbs.db
+
+# Native build artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+build-*/
+build/
+out/
+tmp/
+temp/
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.lib
+*.a
+*.exe
+
+# GPU profiling and benchmark output
+*.nsys-rep
+*.nsys.sqlite
+*.nsys-*
+*.qdrep
+*.qdp
+*.nvvp
+*.ncu-rep
+*.ncu
+*.ncu-*
+*.sass
+*.cubin
+*.fatbin
+*.prof
+*.profraw
+*.profdata
+
+# Logs and temporary artifacts
+*.log
+*.trace
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# Large/generated data
+*.bin
+*.dat
+*.csv.gz
+*.jsonl.gz
+*.parquet
+*.npy
+*.npz
+*.pt
+*.onnx
+*.engine
+*.plan
+
+# Results
+results/*
+!results/.gitkeep

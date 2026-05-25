@@ -1,0 +1,72 @@
+# CUDA Microbenchmarks
+
+This directory contains independent CUDA workloads owned by this framework.
+They do not depend on or modify `third_party`.
+
+## h2d_d2d_copy
+
+`h2d_d2d_copy.cu` implements:
+
+- H2D one-way continuous transfer using pinned host memory
+- D2D global-memory to global-memory continuous copy on one GPU
+- CUDA event based bandwidth measurement
+- JSON-lines stdout suitable for runner summary parsing
+- Optional pre-sweep byte sizes
+
+Build on the H100/B200 server:
+
+```bash
+bash scripts/build_workloads.sh
+```
+
+Override architectures when needed:
+
+```bash
+CUDA_ARCHITECTURES=90 bash scripts/build_workloads.sh
+CUDA_ARCHITECTURES=100 bash scripts/build_workloads.sh
+```
+
+Run:
+
+```bash
+./build/workloads/h2d_d2d_copy --device 0 --mode h2d --bytes 268435456 --warmup-sec 10 --steady-sec 60
+./build/workloads/h2d_d2d_copy --device 0 --mode d2d --bytes 268435456 --warmup-sec 10 --steady-sec 60
+```
+
+## read_write_levels
+
+`read_write_levels.cu` implements the `PWR-MEM-003` read/write load-level sweep.
+The buffer size and launch shape stay comparable across levels; `--load-factor`
+changes the active memory range.
+
+```bash
+./build/workloads/read_write_levels --device 0 --mode read --load-factor 0.125 --buffer-mb 4096 --warmup-sec 10 --steady-sec 60
+./build/workloads/read_write_levels --device 0 --mode write --load-factor 1.0 --buffer-mb 4096 --warmup-sec 10 --steady-sec 60
+```
+
+## tensor_core_burn
+
+`tensor_core_burn.cu` implements the base Tensor Core cases with cuBLAS BF16
+GEMM. It supports time duty-cycle sweeps and active-SM fraction sweeps. CUTLASS
+integration remains optional for a later step and is not required by these
+cases.
+
+```bash
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --warmup-sec 30 --steady-sec 60
+```
+
+## cuda_core_burn
+
+`cuda_core_burn.cu` implements the base CUDA Core cases with custom kernels for
+floating-point FMA and integer/logical activity.
+
+```bash
+./build/workloads/cuda_core_burn --device 0 --mode fp32_fma --duty-cycle 1.0 --buffer-mb 1024 --warmup-sec 30 --steady-sec 60
+./build/workloads/cuda_core_burn --device 0 --mode int32_logic --duty-cycle 1.0 --buffer-mb 1024 --warmup-sec 30 --steady-sec 60
+```
+
+## Advanced Memory
+
+`tma_copy.cu`, `l2_hit_sweep.cu`, and `sm_issue_coverage.cu` cover the staged
+advanced memory cases. See `docs/advanced_memory_cases.md` for assumptions and
+limitations.

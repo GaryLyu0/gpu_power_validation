@@ -1,0 +1,55 @@
+case_id: PWR-MEM-007
+feature_name: MEM/SOC subsystem
+case_name: Half-SM versus full-SM memory issue coverage
+title: Half-SM versus full-SM memory issue coverage
+category: mem
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Kernel launcher can constrain active SM or CTA coverage on the target server.
+  - Memory problem size is large enough to avoid short-run artifacts.
+workload:
+  type: command
+  executable: ./build/workloads/sm_issue_coverage
+  args:
+    - --device
+    - "0"
+    - --active-sm-fraction
+    - "{active_sm_fraction}"
+    - --buffer-mb
+    - "4096"
+    - --warmup-sec
+    - "10"
+    - --steady-sec
+    - "60"
+parameters:
+  warmup_sec: 10
+  steady_sec: 60
+  sweep:
+    active_sm_fraction:
+      - {label: half, value: "0.5"}
+      - {label: full, value: "1.0"}
+    issue_pattern: memory_only
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_gpu_pct
+    - utilization_memory_pct
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Compare memory issue power with half-SM and full-SM coverage.
+  key_metrics: [avg_power_watts_by_coverage, bandwidth_gbps_by_coverage]
+  pass_criteria:
+    - Half and full coverage modes are both represented in the summary.
+    - Full coverage reaches equal or higher memory issue utilization.
+notes:
+  - Active SM fraction is approximated through CTA count; validate actual scheduling coverage with profiler counters.

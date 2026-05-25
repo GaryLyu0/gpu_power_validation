@@ -1,0 +1,53 @@
+case_id: PWR-MEM-006
+feature_name: MEM/SOC subsystem
+case_name: L2 hit-rate power test
+title: L2 hit-rate power test
+category: mem
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Target profiler or kernel counters can estimate L2 hit rate on the server.
+  - Data set sizes are selected to produce distinct cache residency behavior.
+workload:
+  type: command
+  executable: ./build/workloads/l2_hit_sweep
+  args:
+    - --device
+    - "0"
+    - --target
+    - "{l2_target}"
+    - --buffer-mb
+    - "1024"
+    - --warmup-sec
+    - "10"
+    - --steady-sec
+    - "60"
+parameters:
+  warmup_sec: 10
+  steady_sec: 60
+  sweep:
+    l2_target: [low, medium, high]
+    access_pattern: strided_read_write
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_memory_pct
+    - memory_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Measure power impact at low, medium, and high L2 hit-rate targets.
+  key_metrics: [avg_power_watts_by_hit_rate, l2_hit_rate_pct, bandwidth_gbps]
+  pass_criteria:
+    - Each hit-rate target maps to a distinct measured cache-hit band.
+    - Power and bandwidth are reported for every band.
+notes:
+  - Workload shapes are intended to bias L2 locality; verify actual hit rate with Nsight Compute counters on the target server.

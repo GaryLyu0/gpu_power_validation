@@ -1,0 +1,72 @@
+case_id: power_gpu_op_tc_001
+feature_name: AI Core / Tensor Core
+case_name: Tensor Core GEMM power versus active SM coverage
+title: Tensor Core GEMM power versus active SM coverage
+category: core
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - GEMM launcher supports CTA or SM spatial coverage control on target hardware.
+  - GEMM problem sizes are large enough to sustain selected coverage points.
+workload:
+  type: command
+  executable: ./build/workloads/tensor_core_burn
+  args:
+    - --device
+    - "0"
+    - --dtype
+    - bf16
+    - --m
+    - "8192"
+    - --n
+    - "8192"
+    - --k
+    - "8192"
+    - --duty-cycle
+    - "1.0"
+    - --active-sm-fraction
+    - "{active_sm_fraction}"
+    - --warmup-sec
+    - "30"
+    - --steady-sec
+    - "60"
+parameters:
+  warmup_sec: 30
+  steady_sec: 60
+  sweep:
+    active_sm_fraction:
+      - {label: "10pct", value: "0.1"}
+      - {label: "20pct", value: "0.2"}
+      - {label: "30pct", value: "0.3"}
+      - {label: "40pct", value: "0.4"}
+      - {label: "50pct", value: "0.5"}
+      - {label: "60pct", value: "0.6"}
+      - {label: "70pct", value: "0.7"}
+      - {label: "80pct", value: "0.8"}
+      - {label: "90pct", value: "0.9"}
+      - {label: "100pct", value: "1.0"}
+    op: tensor_core_gemm
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_gpu_pct
+    - sm_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Sweep Tensor Core spatial coverage from 10% to 100%.
+  key_metrics: [avg_power_watts_by_coverage, active_sm_coverage_pct]
+  pass_criteria:
+    - Coverage points are reflected in workload metadata.
+    - Power trend and saturation point are reported.
+notes:
+  - Initial spatial coverage uses cuBLAS SM-count targeting where supported by the target CUDA toolkit.
+  - CUTLASS integration is optional and reserved for a later step.

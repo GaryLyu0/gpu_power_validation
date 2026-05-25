@@ -1,0 +1,4 @@
+device: NVIDIA H100
+default_power_limit_watts: 700
+notes: Placeholder defaults; validate against lab policy before enabling controls.
+

@@ -1,0 +1,59 @@
+case_id: PWR-MEM-001
+feature_name: IO subsystem
+case_name: H2D one-way IO saturation power test
+title: H2D one-way IO saturation power test
+category: io
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Host memory allocation policy is configured for repeatable H2D transfer tests.
+  - PCIe or NVLink topology is recorded on the target server.
+workload:
+  type: command
+  executable: ./build/workloads/h2d_d2d_copy
+  args:
+    - --device
+    - "0"
+    - --mode
+    - h2d
+    - --bytes
+    - "268435456"
+    - --warmup-sec
+    - "10"
+    - --steady-sec
+    - "60"
+    - --presweep-bytes
+    - "4096,65536,1048576,16777216,268435456"
+parameters:
+  warmup_sec: 10
+  steady_sec: 60
+  sweep:
+    presweep_block_sizes: [4KB, 64KB, 1MB, 16MB, 256MB]
+    selected_block_size: 256MB
+    direction: H2D
+    transfer_mode: one_way_saturation
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - temperature_c
+    - utilization_memory_pct
+    - memory_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Pre-sweep H2D block sizes, then hold the selected block size for steady IO power.
+  key_metrics: [avg_power_watts, h2d_bandwidth_gbps, selected_block_size]
+  pass_criteria:
+    - Selected block size reaches the saturation region on the H100/B200 server.
+    - Steady-window telemetry is complete.
+notes:
+  - Primary workload is the independent CUDA microbenchmark under workloads/cuda_microbench.
+  - nvbandwidth may be used separately as a cross-check, but this case does not depend on third_party.

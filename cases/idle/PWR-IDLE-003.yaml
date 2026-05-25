@@ -1,0 +1,43 @@
+case_id: PWR-IDLE-003
+feature_name: SOC idle baseline
+case_name: Long idle soak stability
+title: Long idle soak stability
+category: idle
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Target GPU is thermally stable before measurement begins.
+  - Background management jobs are disabled or recorded.
+workload:
+  type: command
+  executable: python
+  args: [workloads/python/idle_sleep.py, --seconds, "300"]
+parameters:
+  warmup_sec: 30
+  steady_sec: 300
+  sweep: []
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 1000
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - temperature_c
+    - sm_clock_mhz
+    - memory_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Capture idle power drift over a longer steady-state window.
+  key_metrics: [avg_power_watts, min_power_watts, max_power_watts, power_stddev_watts]
+  pass_criteria:
+    - No sustained GPU activity is observed.
+    - Power variance stays within lab-defined idle stability limits.
+notes:
+  - Intended for target-server soak validation; dry-run only writes mock artifacts.
+

@@ -1,0 +1,65 @@
+case_id: PWR-MEM-003
+feature_name: MEM/SOC subsystem
+case_name: Read/write load-level power test
+title: Read/write load-level power test
+category: mem
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Memory workload binary is built on the target H100/B200 server.
+  - ECC, MIG, and clock state are recorded before the run.
+workload:
+  type: command
+  executable: ./build/workloads/read_write_levels
+  args:
+    - --device
+    - "0"
+    - --mode
+    - "{mode}"
+    - --load-factor
+    - "{load_factor}"
+    - --buffer-mb
+    - "4096"
+    - --warmup-sec
+    - "10"
+    - --steady-sec
+    - "60"
+parameters:
+  warmup_sec: 10
+  steady_sec: 60
+  sweep:
+    mode: [read, write]
+    load_factor:
+      - {label: L1, value: "0.125"}
+      - {label: L2, value: "0.25"}
+      - {label: L3, value: "0.375"}
+      - {label: L4, value: "0.5"}
+      - {label: L5, value: "0.625"}
+      - {label: L6, value: "0.75"}
+      - {label: L7, value: "0.875"}
+      - {label: L8, value: "1.0"}
+    buffer_mb: 4096
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_memory_pct
+    - memory_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Measure power scaling across 8 memory read/write load levels.
+  key_metrics: [avg_power_watts_by_level, memory_utilization_pct, bandwidth_gbps]
+  pass_criteria:
+    - Power trend is monotonic or deviations are explained by throttling or clocks.
+    - All L1-L8 levels produce valid telemetry.
+notes:
+  - Load factors reduce active memory work while keeping the main 4096 MB buffer and launch shape comparable.
+  - Build and run this CUDA workload only on the target H100/B200 server.

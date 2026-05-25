@@ -1,0 +1,66 @@
+case_id: power_gpu_op_cc_000
+feature_name: CUDA Core
+case_name: Floating-point elementwise power versus time duty cycle
+title: Floating-point elementwise power versus time duty cycle
+category: core
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - CUDA Core FP elementwise workload is built on the target server.
+  - Data set size is sufficient to sustain steady compute.
+workload:
+  type: command
+  executable: ./build/workloads/cuda_core_burn
+  args:
+    - --device
+    - "0"
+    - --mode
+    - fp32_fma
+    - --duty-cycle
+    - "{duty_cycle}"
+    - --buffer-mb
+    - "1024"
+    - --warmup-sec
+    - "30"
+    - --steady-sec
+    - "60"
+parameters:
+  warmup_sec: 30
+  steady_sec: 60
+  sweep:
+    duty_cycle:
+      - {label: "0pct", value: "0.0"}
+      - {label: "10pct", value: "0.1"}
+      - {label: "20pct", value: "0.2"}
+      - {label: "30pct", value: "0.3"}
+      - {label: "40pct", value: "0.4"}
+      - {label: "50pct", value: "0.5"}
+      - {label: "60pct", value: "0.6"}
+      - {label: "70pct", value: "0.7"}
+      - {label: "80pct", value: "0.8"}
+      - {label: "90pct", value: "0.9"}
+      - {label: "100pct", value: "1.0"}
+    op: cuda_core_floating_point_elementwise
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_gpu_pct
+    - sm_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Sweep CUDA Core floating-point elementwise duty cycle.
+  key_metrics: [avg_power_watts_by_duty_cycle, sm_active_pct]
+  pass_criteria:
+    - Every duty-cycle point produces a valid steady-window summary.
+    - Power trend is reported against FP activity.
+notes:
+  - Uses the independent CUDA Core burn microbenchmark; build and run on H100/B200.

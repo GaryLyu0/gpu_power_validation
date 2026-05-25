@@ -1,0 +1,52 @@
+case_id: power_idle_000
+feature_name: real_workload
+case_name: Real workload idle power test for H100/B200
+title: Real workload idle power test for H100/B200
+category: real_workload
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Real workload environment is initialized but no active inference/training step is running.
+  - Container, framework, and driver versions are recorded.
+workload:
+  type: command
+  executable: python
+  args:
+    - workloads/python/real_workload_stub.py
+    - --mode
+    - idle
+    - --warmup-sec
+    - "30"
+    - --steady-sec
+    - "180"
+parameters:
+  warmup_sec: 30
+  steady_sec: 180
+  sweep:
+    workload_profile: initialized_idle
+    default_stub: idle_sleep
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 1000
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - temperature_c
+    - utilization_gpu_pct
+    - utilization_memory_pct
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Measure idle power after the real workload stack is initialized.
+  key_metrics: [avg_power_watts, p95_power_watts, utilization_gpu_pct]
+  pass_criteria:
+    - GPU utilization remains near idle after initialization.
+    - Result can be compared against SOC idle baselines.
+notes:
+  - Uses the idle mode of the real workload stub by default.
+  - Replace the workload command with an initialized model server or framework-specific idle script on the target server.
