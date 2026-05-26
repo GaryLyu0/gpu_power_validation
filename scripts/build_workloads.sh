@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="${repo_root}/build/workloads"
-cuda_architectures="${CUDA_ARCHITECTURES:-90;100}"
+cuda_architectures="${CUDA_ARCHITECTURES:-90}"
 
 cmake \
   -S "${repo_root}/workloads/cuda_microbench" \

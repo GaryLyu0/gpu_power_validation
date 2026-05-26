@@ -8,11 +8,12 @@ The runner is intentionally config-driven:
 - `runner.workload_launcher` resolves commands but does not execute workloads in
   dry-run mode.
 - `runner.telemetry` defines the sampler interface.
-- `runner.nvml_sampler` currently provides only deterministic mock telemetry.
+- `runner.nvml_sampler` provides mock telemetry for local checks and real NVML
+  telemetry behind runtime checks on the H100/B200 server.
 - `runner.result_writer` owns the result directory layout.
 
-Actual NVML sampling, clock control, CUDA kernels, and third-party benchmark
-invocation are future implementation steps.
+Additional workload coverage and third-party benchmark integration are future
+implementation steps.
 
 ## Hardware Boundary
 

@@ -16,7 +16,7 @@ They do not depend on or modify `third_party`.
 Build on the H100/B200 server:
 
 ```bash
-bash scripts/build_workloads.sh
+CUDA_ARCHITECTURES=90 bash scripts/build_workloads.sh
 ```
 
 Override architectures when needed:
@@ -50,6 +50,13 @@ changes the active memory range.
 GEMM. It supports time duty-cycle sweeps and active-SM fraction sweeps. CUTLASS
 integration remains optional for a later step and is not required by these
 cases.
+
+Current Tensor Core limitations:
+
+- BF16 is the baseline implementation.
+- FP16, CUTLASS, FP8, and FP4 are future work.
+- `--active-sm-fraction` maps to a cuBLAS SM-count target hint where supported;
+  validate actual spatial coverage with profiler metrics on the H100 server.
 
 ```bash
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --warmup-sec 30 --steady-sec 60

@@ -48,15 +48,13 @@ python3 -m runner.run_suite --case-dir cases --dry-run
 6. Build CUDA workloads on the H100/B200 server:
 
 ```bash
-bash scripts/build_workloads.sh
+CUDA_ARCHITECTURES=90 bash scripts/build_workloads.sh
 ```
 
 7. Run smoke tests before full validation:
 
 ```bash
-python3 -m runner.run_case --case cases/idle/PWR-IDLE-001.yaml --mock-workload --mock-telemetry
-python3 -m runner.run_case --case cases/io/PWR-MEM-001.yaml --dry-run
-python3 -m runner.run_case --case cases/core/power_gpu_op_tc_000.yaml --dry-run
+bash scripts/h100_smoke_test.sh
 ```
 
 8. Only after the checks above pass, run real power validation on the H100/B200
@@ -135,7 +133,7 @@ The base Tensor Core and CUDA Core power cases use `tensor_core_burn` and
 the target CUDA toolchain:
 
 ```bash
-bash scripts/build_workloads.sh
+CUDA_ARCHITECTURES=90 bash scripts/build_workloads.sh
 ```
 
 Run the H2D one-way transfer workload:
@@ -262,13 +260,15 @@ Run local tests:
 python -B -m pytest
 ```
 
-When hardware implementations are added, run the target-server checks on the
-H100/B200 host, for example:
+`--mock-workload` is only for runner and telemetry plumbing tests. Real Nsight
+Systems and Nsight Compute profiling must run without `--mock-workload`, after
+CUDA workloads are built on the H100/B200 host:
 
 ```bash
-python -m runner.run_case --case cases/core/power_gpu_op_tc_000.yaml --mock-workload
-nsys profile --stats=true --output results/nsys_core python -m runner.run_case --case cases/core/power_gpu_op_tc_000.yaml --mock-workload
-ncu --set full --target-processes all python -m runner.run_case --case cases/core/power_gpu_op_tc_000.yaml --mock-workload
+CUDA_ARCHITECTURES=90 bash scripts/build_workloads.sh
+python -m runner.run_case --case cases/core/power_gpu_op_tc_000.yaml --dry-run
+nsys profile --stats=true --output results/nsys_core python -m runner.run_case --case cases/core/power_gpu_op_tc_000.yaml
+ncu --set full --target-processes all python -m runner.run_case --case cases/core/power_gpu_op_tc_000.yaml
 ```
 
 For the first CUDA IO workload on the H100/B200 server:
