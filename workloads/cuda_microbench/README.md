@@ -46,20 +46,33 @@ changes the active memory range.
 
 ## tensor_core_burn
 
-`tensor_core_burn.cu` implements the base Tensor Core cases with cuBLAS BF16
-GEMM. It supports time duty-cycle sweeps and active-SM fraction sweeps. CUTLASS
-integration remains optional for a later step and is not required by these
-cases.
+`tensor_core_burn.cu` implements the base Tensor Core cases with two engines:
+
+- `--engine cublas` keeps the original cuBLAS BF16 GEMM behavior and remains
+  the default for backward compatibility.
+- `--engine wmma_persistent` launches persistent CTAs and uses device-side
+  `clock64` control so short active/idle periods do not depend on CPU-side GEMM
+  launch timing.
+
+CUTLASS integration remains optional for a later step and is not required by
+these cases.
 
 Current Tensor Core limitations:
 
 - BF16 is the baseline implementation.
 - FP16, CUTLASS, FP8, and FP4 are future work.
-- `--active-sm-fraction` maps to a cuBLAS SM-count target hint where supported;
-  validate actual spatial coverage with profiler metrics on the H100 server.
+- With `--engine cublas`, `--active-sm-fraction` maps to a cuBLAS SM-count
+  target hint where supported.
+- With `--engine wmma_persistent`, `--active-sm-fraction` maps to persistent
+  CTA coverage using one long-lived CTA per requested SM by default.
+- For `wmma_persistent`, `m`, `n`, and `k` are nominal reporting parameters;
+  actual MAC pressure is controlled by persistent CTAs and WMMA loop intensity.
+- Validate actual spatial coverage and Tensor Core utilization with Nsight
+  profiler metrics on the H100 server for both engines.
 
 ```bash
-./build/workloads/tensor_core_burn --device 0 --dtype bf16 --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --warmup-sec 30 --steady-sec 60
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --warmup-sec 30 --steady-sec 60
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wmma_persistent --m 8192 --n 8192 --k 8192 --duty-cycle 0.5 --active-sm-fraction 1.0 --period-ms 10 --warmup-sec 5 --steady-sec 10
 ```
 
 ## cuda_core_burn
