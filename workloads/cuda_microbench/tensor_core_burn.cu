@@ -424,9 +424,22 @@ unsigned long long cycles_for_ms(double ms, int clock_rate_khz) {
   return static_cast<unsigned long long>(cycles);
 }
 
+int get_device_clock_rate_khz(int device) {
+  int clock_rate_khz = 0;
+  check_cuda(cudaDeviceGetAttribute(
+                 &clock_rate_khz,
+                 cudaDevAttrClockRate,
+                 device),
+             "cudaDeviceGetAttribute(cudaDevAttrClockRate)");
+  if (clock_rate_khz <= 0) {
+    throw std::runtime_error("Invalid cudaDevAttrClockRate");
+  }
+  return clock_rate_khz;
+}
+
 void launch_wmma_window(
     const Options& options,
-    const cudaDeviceProp& prop,
+    int clock_rate_khz,
     float* output,
     unsigned long long* iteration_counter,
     int grid_blocks,
@@ -441,9 +454,9 @@ void launch_wmma_window(
   }
 
   const unsigned long long duration_cycles =
-      cycles_for_ms(seconds * 1000.0, prop.clockRate);
+      cycles_for_ms(seconds * 1000.0, clock_rate_khz);
   const unsigned long long period_cycles =
-      cycles_for_ms(options.period_ms, prop.clockRate);
+      cycles_for_ms(options.period_ms, clock_rate_khz);
   const unsigned long long active_cycles =
       static_cast<unsigned long long>(std::floor(period_cycles * options.duty_cycle));
 
@@ -465,6 +478,7 @@ Result measure_wmma_persistent(
     throw std::runtime_error("engine=wmma_persistent requires SM80 or newer for BF16 WMMA");
   }
 
+  const int clock_rate_khz = get_device_clock_rate_khz(options.device);
   constexpr int blocks_per_sm = 1;
   const int grid_blocks = requested_sm_count * blocks_per_sm;
   constexpr int warps_per_block = 4;
@@ -483,13 +497,13 @@ Result measure_wmma_persistent(
 
   try {
     launch_wmma_window(
-        options, prop, output, iteration_counter, grid_blocks, options.warmup_sec, true);
+        options, clock_rate_khz, output, iteration_counter, grid_blocks, options.warmup_sec, true);
     check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(wmma warmup)");
 
     EventPair events;
     check_cuda(cudaEventRecord(events.start()), "cudaEventRecord(wmma start)");
     launch_wmma_window(
-        options, prop, output, iteration_counter, grid_blocks, options.steady_sec, true);
+        options, clock_rate_khz, output, iteration_counter, grid_blocks, options.steady_sec, true);
     check_cuda(cudaEventRecord(events.stop()), "cudaEventRecord(wmma stop)");
     check_cuda(cudaEventSynchronize(events.stop()), "cudaEventSynchronize(wmma stop)");
 
