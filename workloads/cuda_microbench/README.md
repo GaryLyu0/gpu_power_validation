@@ -66,13 +66,17 @@ Current Tensor Core limitations:
 - With `--engine wmma_persistent`, `--active-sm-fraction` maps to persistent
   CTA coverage using one long-lived CTA per requested SM by default.
 - For `wmma_persistent`, `m`, `n`, and `k` are nominal reporting parameters;
-  actual MAC pressure is controlled by persistent CTAs and WMMA loop intensity.
+  actual MAC pressure is controlled by `--blocks-per-sm`,
+  `--mma-iters-per-loop`, `--active-sm-fraction`, `--duty-cycle`, and
+  `--period-ms`. `--period-ms` controls active/idle switching cadence, not
+  active compute intensity.
 - Validate actual spatial coverage and Tensor Core utilization with Nsight
   profiler metrics on the H100 server for both engines.
 
 ```bash
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --warmup-sec 30 --steady-sec 60
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wmma_persistent --m 8192 --n 8192 --k 8192 --duty-cycle 0.5 --active-sm-fraction 1.0 --period-ms 10 --warmup-sec 5 --steady-sec 10
+./build/workloads/tensor_core_burn --device 4 --dtype bf16 --engine wmma_persistent --m 16384 --n 16384 --k 16384 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 2 --mma-iters-per-loop 256 --warmup-sec 5 --steady-sec 10
 ```
 
 ## cuda_core_burn

@@ -28,6 +28,9 @@ struct Options {
   double warmup_sec = 30.0;
   double steady_sec = 60.0;
   double period_ms = 1000.0;
+  int blocks_per_sm = 1;
+  int mma_iters_per_loop = 64;
+  int atomic_period = 1024;
 };
 
 struct Result {
@@ -51,6 +54,8 @@ struct Result {
   bool sm_count_target_applied = false;
   int grid_blocks = 0;
   int blocks_per_sm = 0;
+  int mma_iters_per_loop = 0;
+  int atomic_period = 0;
   std::string note;
 };
 
@@ -130,15 +135,25 @@ Options parse_args(int argc, char** argv) {
       options.steady_sec = parse_double(require_value(arg), arg);
     } else if (arg == "--period-ms") {
       options.period_ms = parse_double(require_value(arg), arg);
+    } else if (arg == "--blocks-per-sm") {
+      options.blocks_per_sm = parse_int(require_value(arg), arg);
+    } else if (arg == "--mma-iters-per-loop") {
+      options.mma_iters_per_loop = parse_int(require_value(arg), arg);
+    } else if (arg == "--atomic-period") {
+      options.atomic_period = parse_int(require_value(arg), arg);
     } else if (arg == "--help") {
       std::cout
           << "Usage: tensor_core_burn --device 0 --dtype bf16 "
           << "--engine cublas|wmma_persistent --m 8192 --n 8192 "
           << "--k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 "
-          << "--period-ms 1000 --warmup-sec 30 --steady-sec 60\n\n"
+          << "--period-ms 1000 --blocks-per-sm 1 "
+          << "--mma-iters-per-loop 64 --atomic-period 1024 "
+          << "--warmup-sec 30 --steady-sec 60\n\n"
           << "engine=cublas keeps the original cuBLAS GEMM active/idle windows.\n"
           << "engine=wmma_persistent launches persistent CTAs and controls "
-          << "active/idle phases inside the CUDA kernel with clock64.\n";
+          << "active/idle phases inside the CUDA kernel with clock64. "
+          << "For wmma_persistent, --period-ms controls switching cadence while "
+          << "--blocks-per-sm and --mma-iters-per-loop control active intensity.\n";
       std::exit(0);
     } else {
       throw std::runtime_error("Unknown argument: " + arg);
@@ -162,6 +177,15 @@ Options parse_args(int argc, char** argv) {
   }
   if (options.period_ms <= 0.0) {
     throw std::runtime_error("--period-ms must be > 0");
+  }
+  if (options.blocks_per_sm <= 0) {
+    throw std::runtime_error("--blocks-per-sm must be > 0");
+  }
+  if (options.mma_iters_per_loop <= 0) {
+    throw std::runtime_error("--mma-iters-per-loop must be > 0");
+  }
+  if (options.atomic_period <= 0) {
+    throw std::runtime_error("--atomic-period must be > 0");
   }
   return options;
 }
@@ -289,6 +313,8 @@ Result measure_cublas(
         sm_count_target_applied,
         0,
         0,
+        0,
+        0,
         "cuBLAS engine preserves the original CPU-controlled active/idle window behavior.",
     };
   }
@@ -342,6 +368,8 @@ Result measure_cublas(
       sm_count_target_applied,
       0,
       0,
+      0,
+      0,
       "cuBLAS active_sm_fraction is a cuBLAS SM-count target hint; validate actual activity with profiler metrics.",
   };
 }
@@ -351,15 +379,17 @@ __global__ void wmma_persistent_bf16_kernel(
     unsigned long long* iterations,
     unsigned long long duration_cycles,
     unsigned long long period_cycles,
-    unsigned long long active_cycles) {
+    unsigned long long active_cycles,
+    int mma_iters_per_loop,
+    int atomic_period) {
   constexpr int kTileM = 16;
   constexpr int kTileN = 16;
   constexpr int kTileK = 16;
-  constexpr int kMmaPerLoop = 64;
   constexpr int kWarpsPerBlock = 4;
 
   const unsigned long long start = clock64();
   const int warp_id = threadIdx.x / 32;
+  unsigned long long pending_iterations = 0;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   namespace wmma = nvcuda::wmma;
@@ -386,21 +416,32 @@ __global__ void wmma_persistent_bf16_kernel(
 
     if (active) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-#pragma unroll 4
-      for (int i = 0; i < kMmaPerLoop; ++i) {
+      for (int i = 0; i < mma_iters_per_loop; ++i) {
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
       }
       if ((threadIdx.x % 32) == 0) {
-        atomicAdd(iterations, static_cast<unsigned long long>(kMmaPerLoop));
+        pending_iterations += static_cast<unsigned long long>(mma_iters_per_loop);
+        if (pending_iterations >= static_cast<unsigned long long>(atomic_period)) {
+          atomicAdd(iterations, pending_iterations);
+          pending_iterations = 0;
+        }
       }
 #else
       if ((threadIdx.x % 32) == 0) {
-        atomicAdd(iterations, 1ULL);
+        pending_iterations += 1ULL;
+        if (pending_iterations >= static_cast<unsigned long long>(atomic_period)) {
+          atomicAdd(iterations, pending_iterations);
+          pending_iterations = 0;
+        }
       }
 #endif
     } else {
       __nanosleep(1000);
     }
+  }
+
+  if ((threadIdx.x % 32) == 0 && pending_iterations > 0) {
+    atomicAdd(iterations, pending_iterations);
   }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -466,7 +507,9 @@ void launch_wmma_window(
       iteration_counter,
       duration_cycles,
       period_cycles,
-      active_cycles);
+      active_cycles,
+      options.mma_iters_per_loop,
+      options.atomic_period);
   check_cuda(cudaGetLastError(), "wmma_persistent_bf16_kernel");
 }
 
@@ -479,7 +522,7 @@ Result measure_wmma_persistent(
   }
 
   const int clock_rate_khz = get_device_clock_rate_khz(options.device);
-  constexpr int blocks_per_sm = 1;
+  const int blocks_per_sm = options.blocks_per_sm;
   const int grid_blocks = requested_sm_count * blocks_per_sm;
   constexpr int warps_per_block = 4;
   constexpr int output_values_per_block = warps_per_block * 16 * 16;
@@ -546,7 +589,9 @@ Result measure_wmma_persistent(
         false,
         grid_blocks,
         blocks_per_sm,
-        "wmma_persistent uses m/n/k as nominal reporting parameters; MAC pressure is controlled by persistent CTAs and mma_sync loop intensity. Validate Tensor Core utilization with Nsight profiler metrics.",
+        options.mma_iters_per_loop,
+        options.atomic_period,
+        "wmma_persistent uses m/n/k as nominal reporting parameters; actual MAC pressure is controlled by blocks_per_sm, mma_iters_per_loop, active_sm_fraction, duty_cycle, and period_ms. Validate Tensor Core utilization with Nsight profiler metrics.",
     };
   } catch (...) {
     cudaFree(output);
@@ -579,6 +624,8 @@ void print_json(const Result& result) {
             << (result.sm_count_target_applied ? "true" : "false") << ","
             << "\"grid_blocks\":" << result.grid_blocks << ","
             << "\"blocks_per_sm\":" << result.blocks_per_sm << ","
+            << "\"mma_iters_per_loop\":" << result.mma_iters_per_loop << ","
+            << "\"atomic_period\":" << result.atomic_period << ","
             << "\"note\":\"" << result.note << "\""
             << "}" << std::endl;
 }

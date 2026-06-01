@@ -199,6 +199,7 @@ Run the base AI Core workloads directly:
 ./build/workloads/tensor_core_burn \
   --device 0 \
   --dtype bf16 \
+  --engine cublas \
   --m 8192 --n 8192 --k 8192 \
   --duty-cycle 1.0 \
   --active-sm-fraction 1.0 \
@@ -221,6 +222,14 @@ Run the base AI Core workloads directly:
   --warmup-sec 30 \
   --steady-sec 60
 ```
+
+`tensor_core_burn` defaults to `--engine cublas`, where
+`--active-sm-fraction` is a cuBLAS SM-count target hint. The optional
+`--engine wmma_persistent` path uses persistent CTA coverage and device-side
+`clock64` duty-cycle control. In `wmma_persistent` mode, `--period-ms` controls
+active/idle switching cadence; `--blocks-per-sm` and `--mma-iters-per-loop`
+control active compute intensity. For both engines, validate actual SM activity
+and Tensor Core utilization with Nsight profiler metrics on the H100 server.
 
 `nvbandwidth` can be built separately from `third_party/nvbandwidth` and used as
 a cross-check, but the primary IO cases do not depend on it and this framework
