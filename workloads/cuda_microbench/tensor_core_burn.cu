@@ -30,6 +30,7 @@ struct Options {
   double period_ms = 1000.0;
   int blocks_per_sm = 1;
   int mma_iters_per_loop = 64;
+  int accumulators_per_warp = 1;
   int atomic_period = 1024;
 };
 
@@ -55,6 +56,7 @@ struct Result {
   int grid_blocks = 0;
   int blocks_per_sm = 0;
   int mma_iters_per_loop = 0;
+  int accumulators_per_warp = 0;
   int atomic_period = 0;
   std::string note;
 };
@@ -139,6 +141,8 @@ Options parse_args(int argc, char** argv) {
       options.blocks_per_sm = parse_int(require_value(arg), arg);
     } else if (arg == "--mma-iters-per-loop") {
       options.mma_iters_per_loop = parse_int(require_value(arg), arg);
+    } else if (arg == "--accumulators-per-warp") {
+      options.accumulators_per_warp = parse_int(require_value(arg), arg);
     } else if (arg == "--atomic-period") {
       options.atomic_period = parse_int(require_value(arg), arg);
     } else if (arg == "--help") {
@@ -147,13 +151,15 @@ Options parse_args(int argc, char** argv) {
           << "--engine cublas|wmma_persistent --m 8192 --n 8192 "
           << "--k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 "
           << "--period-ms 1000 --blocks-per-sm 1 "
-          << "--mma-iters-per-loop 64 --atomic-period 1024 "
+          << "--mma-iters-per-loop 64 --accumulators-per-warp 1 "
+          << "--atomic-period 1024 "
           << "--warmup-sec 30 --steady-sec 60\n\n"
           << "engine=cublas keeps the original cuBLAS GEMM active/idle windows.\n"
           << "engine=wmma_persistent launches persistent CTAs and controls "
           << "active/idle phases inside the CUDA kernel with clock64. "
           << "For wmma_persistent, --period-ms controls switching cadence while "
-          << "--blocks-per-sm and --mma-iters-per-loop control active intensity.\n";
+          << "--blocks-per-sm, --mma-iters-per-loop, and "
+          << "--accumulators-per-warp control active intensity.\n";
       std::exit(0);
     } else {
       throw std::runtime_error("Unknown argument: " + arg);
@@ -183,6 +189,10 @@ Options parse_args(int argc, char** argv) {
   }
   if (options.mma_iters_per_loop <= 0) {
     throw std::runtime_error("--mma-iters-per-loop must be > 0");
+  }
+  if (options.accumulators_per_warp != 1 && options.accumulators_per_warp != 2 &&
+      options.accumulators_per_warp != 4 && options.accumulators_per_warp != 8) {
+    throw std::runtime_error("--accumulators-per-warp must be one of: 1, 2, 4, 8");
   }
   if (options.atomic_period <= 0) {
     throw std::runtime_error("--atomic-period must be > 0");
@@ -315,6 +325,7 @@ Result measure_cublas(
         0,
         0,
         0,
+        0,
         "cuBLAS engine preserves the original CPU-controlled active/idle window behavior.",
     };
   }
@@ -370,6 +381,7 @@ Result measure_cublas(
       0,
       0,
       0,
+      0,
       "cuBLAS active_sm_fraction is a cuBLAS SM-count target hint; validate actual activity with profiler metrics.",
   };
 }
@@ -381,11 +393,13 @@ __global__ void wmma_persistent_bf16_kernel(
     unsigned long long period_cycles,
     unsigned long long active_cycles,
     int mma_iters_per_loop,
+    int accumulators_per_warp,
     int atomic_period) {
   constexpr int kTileM = 16;
   constexpr int kTileN = 16;
   constexpr int kTileK = 16;
   constexpr int kWarpsPerBlock = 4;
+  constexpr int kMaxAccumulatorsPerWarp = 8;
 
   const unsigned long long start = clock64();
   const int warp_id = threadIdx.x / 32;
@@ -397,11 +411,14 @@ __global__ void wmma_persistent_bf16_kernel(
       a_frag;
   wmma::fragment<wmma::matrix_b, kTileM, kTileN, kTileK, __nv_bfloat16, wmma::col_major>
       b_frag;
-  wmma::fragment<wmma::accumulator, kTileM, kTileN, kTileK, float> c_frag;
+  wmma::fragment<wmma::accumulator, kTileM, kTileN, kTileK, float>
+      c_frags[kMaxAccumulatorsPerWarp];
 
   wmma::fill_fragment(a_frag, __float2bfloat16(1.0f));
   wmma::fill_fragment(b_frag, __float2bfloat16(1.0f));
-  wmma::fill_fragment(c_frag, 0.0f);
+  for (int acc = 0; acc < kMaxAccumulatorsPerWarp; ++acc) {
+    wmma::fill_fragment(c_frags[acc], 0.0f);
+  }
 #endif
 
   while (true) {
@@ -417,10 +434,13 @@ __global__ void wmma_persistent_bf16_kernel(
     if (active) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
       for (int i = 0; i < mma_iters_per_loop; ++i) {
-        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        for (int acc = 0; acc < accumulators_per_warp; ++acc) {
+          wmma::mma_sync(c_frags[acc], a_frag, b_frag, c_frags[acc]);
+        }
       }
       if ((threadIdx.x % 32) == 0) {
-        pending_iterations += static_cast<unsigned long long>(mma_iters_per_loop);
+        pending_iterations += static_cast<unsigned long long>(mma_iters_per_loop) *
+                              static_cast<unsigned long long>(accumulators_per_warp);
         if (pending_iterations >= static_cast<unsigned long long>(atomic_period)) {
           atomicAdd(iterations, pending_iterations);
           pending_iterations = 0;
@@ -445,14 +465,18 @@ __global__ void wmma_persistent_bf16_kernel(
   }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  wmma::store_matrix_sync(
-      output +
-          (static_cast<unsigned int>(blockIdx.x) * kWarpsPerBlock +
-           static_cast<unsigned int>(warp_id)) *
-              kTileM * kTileN,
-      c_frag,
-      kTileN,
-      wmma::mem_row_major);
+  for (int acc = 0; acc < accumulators_per_warp; ++acc) {
+    wmma::store_matrix_sync(
+        output +
+            ((static_cast<unsigned int>(blockIdx.x) * kWarpsPerBlock +
+              static_cast<unsigned int>(warp_id)) *
+                 accumulators_per_warp +
+             static_cast<unsigned int>(acc)) *
+                kTileM * kTileN,
+        c_frags[acc],
+        kTileN,
+        wmma::mem_row_major);
+  }
 #else
   if (threadIdx.x == 0) {
     output[blockIdx.x] = 0.0f;
@@ -509,6 +533,7 @@ void launch_wmma_window(
       period_cycles,
       active_cycles,
       options.mma_iters_per_loop,
+      options.accumulators_per_warp,
       options.atomic_period);
   check_cuda(cudaGetLastError(), "wmma_persistent_bf16_kernel");
 }
@@ -525,7 +550,7 @@ Result measure_wmma_persistent(
   const int blocks_per_sm = options.blocks_per_sm;
   const int grid_blocks = requested_sm_count * blocks_per_sm;
   constexpr int warps_per_block = 4;
-  constexpr int output_values_per_block = warps_per_block * 16 * 16;
+  const int output_values_per_block = warps_per_block * options.accumulators_per_warp * 16 * 16;
   float* output = nullptr;
   unsigned long long* iteration_counter = nullptr;
   unsigned long long host_iterations = 0;
@@ -590,8 +615,9 @@ Result measure_wmma_persistent(
         grid_blocks,
         blocks_per_sm,
         options.mma_iters_per_loop,
+        options.accumulators_per_warp,
         options.atomic_period,
-        "wmma_persistent uses m/n/k as nominal reporting parameters; actual MAC pressure is controlled by blocks_per_sm, mma_iters_per_loop, active_sm_fraction, duty_cycle, and period_ms. Validate Tensor Core utilization with Nsight profiler metrics.",
+        "wmma_persistent uses m/n/k as nominal reporting parameters; actual MAC pressure is controlled by blocks_per_sm, mma_iters_per_loop, accumulators_per_warp, atomic_period, active_sm_fraction, duty_cycle, and period_ms. Validate Tensor Core utilization with Nsight profiler metrics.",
     };
   } catch (...) {
     cudaFree(output);
@@ -625,6 +651,7 @@ void print_json(const Result& result) {
             << "\"grid_blocks\":" << result.grid_blocks << ","
             << "\"blocks_per_sm\":" << result.blocks_per_sm << ","
             << "\"mma_iters_per_loop\":" << result.mma_iters_per_loop << ","
+            << "\"accumulators_per_warp\":" << result.accumulators_per_warp << ","
             << "\"atomic_period\":" << result.atomic_period << ","
             << "\"note\":\"" << result.note << "\""
             << "}" << std::endl;
