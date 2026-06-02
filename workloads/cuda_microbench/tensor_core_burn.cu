@@ -16,6 +16,9 @@
 
 namespace {
 
+constexpr int kWmmaThreadsPerBlock = 128;
+constexpr int kWmmaDynamicSmemBytes = 0;
+
 struct Options {
   int device = 0;
   std::string dtype = "bf16";
@@ -58,6 +61,9 @@ struct Result {
   int mma_iters_per_loop = 0;
   int accumulators_per_warp = 0;
   int atomic_period = 0;
+  int occupancy_max_active_blocks_per_sm = 0;
+  int effective_blocks_per_sm_estimate = 0;
+  bool occupancy_limited = false;
   std::string note;
 };
 
@@ -326,6 +332,9 @@ Result measure_cublas(
         0,
         0,
         0,
+        0,
+        0,
+        false,
         "cuBLAS engine preserves the original CPU-controlled active/idle window behavior.",
     };
   }
@@ -382,6 +391,9 @@ Result measure_cublas(
       0,
       0,
       0,
+      0,
+      0,
+      false,
       "cuBLAS active_sm_fraction is a cuBLAS SM-count target hint; validate actual activity with profiler metrics.",
   };
 }
@@ -507,6 +519,33 @@ int get_device_clock_rate_khz(int device) {
 }
 
 template <int AccumulatorsPerWarp>
+int query_wmma_occupancy_max_active_blocks_per_sm() {
+  int max_active_blocks = 0;
+  check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                 &max_active_blocks,
+                 wmma_persistent_bf16_kernel<AccumulatorsPerWarp>,
+                 kWmmaThreadsPerBlock,
+                 kWmmaDynamicSmemBytes),
+             "cudaOccupancyMaxActiveBlocksPerMultiprocessor(wmma_persistent_bf16_kernel)");
+  return max_active_blocks;
+}
+
+int query_wmma_occupancy_dispatch(int accumulators_per_warp) {
+  switch (accumulators_per_warp) {
+    case 1:
+      return query_wmma_occupancy_max_active_blocks_per_sm<1>();
+    case 2:
+      return query_wmma_occupancy_max_active_blocks_per_sm<2>();
+    case 4:
+      return query_wmma_occupancy_max_active_blocks_per_sm<4>();
+    case 8:
+      return query_wmma_occupancy_max_active_blocks_per_sm<8>();
+    default:
+      throw std::runtime_error("--accumulators-per-warp must be one of: 1, 2, 4, 8");
+  }
+}
+
+template <int AccumulatorsPerWarp>
 void launch_wmma_window(
     const Options& options,
     int clock_rate_khz,
@@ -530,8 +569,7 @@ void launch_wmma_window(
   const unsigned long long active_cycles =
       static_cast<unsigned long long>(std::floor(period_cycles * options.duty_cycle));
 
-  constexpr int threads_per_block = 128;
-  wmma_persistent_bf16_kernel<AccumulatorsPerWarp><<<grid_blocks, threads_per_block>>>(
+  wmma_persistent_bf16_kernel<AccumulatorsPerWarp><<<grid_blocks, kWmmaThreadsPerBlock>>>(
       output,
       iteration_counter,
       duration_cycles,
@@ -583,6 +621,11 @@ Result measure_wmma_persistent(
   const int clock_rate_khz = get_device_clock_rate_khz(options.device);
   const int blocks_per_sm = options.blocks_per_sm;
   const int grid_blocks = requested_sm_count * blocks_per_sm;
+  const int occupancy_max_active_blocks_per_sm =
+      query_wmma_occupancy_dispatch(options.accumulators_per_warp);
+  const int effective_blocks_per_sm_estimate =
+      std::min(blocks_per_sm, occupancy_max_active_blocks_per_sm);
+  const bool occupancy_limited = blocks_per_sm > occupancy_max_active_blocks_per_sm;
   constexpr int warps_per_block = 4;
   const int output_values_per_block = warps_per_block * options.accumulators_per_warp * 16 * 16;
   float* output = nullptr;
@@ -651,7 +694,10 @@ Result measure_wmma_persistent(
         options.mma_iters_per_loop,
         options.accumulators_per_warp,
         options.atomic_period,
-        "wmma_persistent uses m/n/k as nominal reporting parameters; actual MAC pressure is controlled by blocks_per_sm, mma_iters_per_loop, accumulators_per_warp, atomic_period, active_sm_fraction, duty_cycle, and period_ms. Validate Tensor Core utilization with Nsight profiler metrics.",
+        occupancy_max_active_blocks_per_sm,
+        effective_blocks_per_sm_estimate,
+        occupancy_limited,
+        "wmma_persistent uses m/n/k as nominal reporting parameters; actual MAC pressure is controlled by blocks_per_sm, mma_iters_per_loop, accumulators_per_warp, atomic_period, active_sm_fraction, duty_cycle, and period_ms. blocks_per_sm is requested launch density; actual resident CTA count is bounded by occupancy. Validate Tensor Core utilization with Nsight profiler metrics.",
     };
   } catch (...) {
     cudaFree(output);
@@ -687,6 +733,12 @@ void print_json(const Result& result) {
             << "\"mma_iters_per_loop\":" << result.mma_iters_per_loop << ","
             << "\"accumulators_per_warp\":" << result.accumulators_per_warp << ","
             << "\"atomic_period\":" << result.atomic_period << ","
+            << "\"occupancy_max_active_blocks_per_sm\":"
+            << result.occupancy_max_active_blocks_per_sm << ","
+            << "\"effective_blocks_per_sm_estimate\":"
+            << result.effective_blocks_per_sm_estimate << ","
+            << "\"occupancy_limited\":"
+            << (result.occupancy_limited ? "true" : "false") << ","
             << "\"note\":\"" << result.note << "\""
             << "}" << std::endl;
 }
