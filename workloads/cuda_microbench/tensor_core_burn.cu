@@ -386,6 +386,9 @@ Result measure_cublas(
   };
 }
 
+// Accumulator count is compile-time specialized so variants with 1, 2, or 4
+// accumulators do not pay register pressure for unused fragments.
+template <int AccumulatorsPerWarp>
 __global__ void wmma_persistent_bf16_kernel(
     float* output,
     unsigned long long* iterations,
@@ -393,13 +396,11 @@ __global__ void wmma_persistent_bf16_kernel(
     unsigned long long period_cycles,
     unsigned long long active_cycles,
     int mma_iters_per_loop,
-    int accumulators_per_warp,
     int atomic_period) {
   constexpr int kTileM = 16;
   constexpr int kTileN = 16;
   constexpr int kTileK = 16;
   constexpr int kWarpsPerBlock = 4;
-  constexpr int kMaxAccumulatorsPerWarp = 8;
 
   const unsigned long long start = clock64();
   const int warp_id = threadIdx.x / 32;
@@ -412,11 +413,12 @@ __global__ void wmma_persistent_bf16_kernel(
   wmma::fragment<wmma::matrix_b, kTileM, kTileN, kTileK, __nv_bfloat16, wmma::col_major>
       b_frag;
   wmma::fragment<wmma::accumulator, kTileM, kTileN, kTileK, float>
-      c_frags[kMaxAccumulatorsPerWarp];
+      c_frags[AccumulatorsPerWarp];
 
   wmma::fill_fragment(a_frag, __float2bfloat16(1.0f));
   wmma::fill_fragment(b_frag, __float2bfloat16(1.0f));
-  for (int acc = 0; acc < kMaxAccumulatorsPerWarp; ++acc) {
+#pragma unroll
+  for (int acc = 0; acc < AccumulatorsPerWarp; ++acc) {
     wmma::fill_fragment(c_frags[acc], 0.0f);
   }
 #endif
@@ -434,13 +436,14 @@ __global__ void wmma_persistent_bf16_kernel(
     if (active) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
       for (int i = 0; i < mma_iters_per_loop; ++i) {
-        for (int acc = 0; acc < accumulators_per_warp; ++acc) {
+#pragma unroll
+        for (int acc = 0; acc < AccumulatorsPerWarp; ++acc) {
           wmma::mma_sync(c_frags[acc], a_frag, b_frag, c_frags[acc]);
         }
       }
       if ((threadIdx.x % 32) == 0) {
         pending_iterations += static_cast<unsigned long long>(mma_iters_per_loop) *
-                              static_cast<unsigned long long>(accumulators_per_warp);
+                              static_cast<unsigned long long>(AccumulatorsPerWarp);
         if (pending_iterations >= static_cast<unsigned long long>(atomic_period)) {
           atomicAdd(iterations, pending_iterations);
           pending_iterations = 0;
@@ -448,7 +451,7 @@ __global__ void wmma_persistent_bf16_kernel(
       }
 #else
       if ((threadIdx.x % 32) == 0) {
-        pending_iterations += 1ULL;
+        pending_iterations += static_cast<unsigned long long>(AccumulatorsPerWarp);
         if (pending_iterations >= static_cast<unsigned long long>(atomic_period)) {
           atomicAdd(iterations, pending_iterations);
           pending_iterations = 0;
@@ -465,12 +468,13 @@ __global__ void wmma_persistent_bf16_kernel(
   }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  for (int acc = 0; acc < accumulators_per_warp; ++acc) {
+#pragma unroll
+  for (int acc = 0; acc < AccumulatorsPerWarp; ++acc) {
     wmma::store_matrix_sync(
         output +
             ((static_cast<unsigned int>(blockIdx.x) * kWarpsPerBlock +
               static_cast<unsigned int>(warp_id)) *
-                 accumulators_per_warp +
+                 AccumulatorsPerWarp +
              static_cast<unsigned int>(acc)) *
                 kTileM * kTileN,
         c_frags[acc],
@@ -502,6 +506,7 @@ int get_device_clock_rate_khz(int device) {
   return clock_rate_khz;
 }
 
+template <int AccumulatorsPerWarp>
 void launch_wmma_window(
     const Options& options,
     int clock_rate_khz,
@@ -526,16 +531,45 @@ void launch_wmma_window(
       static_cast<unsigned long long>(std::floor(period_cycles * options.duty_cycle));
 
   constexpr int threads_per_block = 128;
-  wmma_persistent_bf16_kernel<<<grid_blocks, threads_per_block>>>(
+  wmma_persistent_bf16_kernel<AccumulatorsPerWarp><<<grid_blocks, threads_per_block>>>(
       output,
       iteration_counter,
       duration_cycles,
       period_cycles,
       active_cycles,
       options.mma_iters_per_loop,
-      options.accumulators_per_warp,
       options.atomic_period);
   check_cuda(cudaGetLastError(), "wmma_persistent_bf16_kernel");
+}
+
+void launch_wmma_window_dispatch(
+    const Options& options,
+    int clock_rate_khz,
+    float* output,
+    unsigned long long* iteration_counter,
+    int grid_blocks,
+    double seconds,
+    bool reset_counter) {
+  switch (options.accumulators_per_warp) {
+    case 1:
+      launch_wmma_window<1>(
+          options, clock_rate_khz, output, iteration_counter, grid_blocks, seconds, reset_counter);
+      return;
+    case 2:
+      launch_wmma_window<2>(
+          options, clock_rate_khz, output, iteration_counter, grid_blocks, seconds, reset_counter);
+      return;
+    case 4:
+      launch_wmma_window<4>(
+          options, clock_rate_khz, output, iteration_counter, grid_blocks, seconds, reset_counter);
+      return;
+    case 8:
+      launch_wmma_window<8>(
+          options, clock_rate_khz, output, iteration_counter, grid_blocks, seconds, reset_counter);
+      return;
+    default:
+      throw std::runtime_error("--accumulators-per-warp must be one of: 1, 2, 4, 8");
+  }
 }
 
 Result measure_wmma_persistent(
@@ -564,13 +598,13 @@ Result measure_wmma_persistent(
              "cudaMalloc(iteration_counter)");
 
   try {
-    launch_wmma_window(
+    launch_wmma_window_dispatch(
         options, clock_rate_khz, output, iteration_counter, grid_blocks, options.warmup_sec, true);
     check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(wmma warmup)");
 
     EventPair events;
     check_cuda(cudaEventRecord(events.start()), "cudaEventRecord(wmma start)");
-    launch_wmma_window(
+    launch_wmma_window_dispatch(
         options, clock_rate_khz, output, iteration_counter, grid_blocks, options.steady_sec, true);
     check_cuda(cudaEventRecord(events.stop()), "cudaEventRecord(wmma stop)");
     check_cuda(cudaEventSynchronize(events.stop()), "cudaEventSynchronize(wmma stop)");
