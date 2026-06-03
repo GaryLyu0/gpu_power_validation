@@ -76,9 +76,18 @@ Current Tensor Core limitations:
   `effective_blocks_per_sm_estimate`, and `occupancy_limited` because
   `--blocks-per-sm` is requested launch density, not guaranteed resident CTA
   count.
+- `--sparsity-mode dense_zero` inserts zero values into selected dense operands
+  and still uses dense Tensor Core instructions. It measures operand zero-value
+  effects, not true sparse Tensor Core execution.
+- `--sparsity-mode structured_2to4` is reserved for real 2:4 sparse Tensor Core
+  execution through a backend such as cuSPARSELt or CUTLASS SparseGemm. If the
+  backend is not available, the workload fails clearly rather than falling back
+  to dense execution.
 
 ```bash
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --warmup-sec 30 --steady-sec 60
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --sparsity-mode dense_zero --zero-ratio 0.5 --zero-pattern regular_k --sparse-operand A --warmup-sec 5 --steady-sec 10
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --sparsity-mode structured_2to4 --sparse-engine cusparselt --warmup-sec 5 --steady-sec 10
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wmma_persistent --m 8192 --n 8192 --k 8192 --duty-cycle 0.5 --active-sm-fraction 1.0 --period-ms 10 --warmup-sec 5 --steady-sec 10
 ./build/workloads/tensor_core_burn --device 4 --dtype bf16 --engine wmma_persistent --m 16384 --n 16384 --k 16384 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 2 --mma-iters-per-loop 256 --warmup-sec 5 --steady-sec 10
 ./build/workloads/tensor_core_burn --device 4 --dtype bf16 --engine wmma_persistent --m 16384 --n 16384 --k 16384 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 3 --mma-iters-per-loop 256 --accumulators-per-warp 4 --atomic-period 8192 --warmup-sec 5 --steady-sec 20

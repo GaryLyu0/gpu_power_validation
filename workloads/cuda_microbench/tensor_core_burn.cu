@@ -35,6 +35,11 @@ struct Options {
   int mma_iters_per_loop = 64;
   int accumulators_per_warp = 1;
   int atomic_period = 1024;
+  std::string sparsity_mode = "none";
+  double zero_ratio = 0.0;
+  std::string zero_pattern = "regular_k";
+  std::string sparse_operand = "A";
+  std::string sparse_engine = "cusparselt";
 };
 
 struct Result {
@@ -64,8 +69,65 @@ struct Result {
   int occupancy_max_active_blocks_per_sm = 0;
   int effective_blocks_per_sm_estimate = 0;
   bool occupancy_limited = false;
+  std::string sparsity_mode = "none";
+  double zero_ratio = 0.0;
+  std::string zero_pattern = "regular_k";
+  std::string sparse_operand = "A";
+  std::string sparse_engine = "";
+  std::string sparse_pattern = "";
+  bool uses_sparse_tensor_core = false;
+  bool dense_mma_instruction_count_unchanged = true;
+  bool correctness_smoke_passed = false;
+  double correctness_reference = 0.0;
+  double correctness_observed = 0.0;
+  double correctness_abs_error = 0.0;
+  int logical_m = 0;
+  int logical_n = 0;
+  int logical_k = 0;
+  double dense_equivalent_flops = 0.0;
+  double measured_runtime_ms = 0.0;
+  double dense_baseline_tflops = 0.0;
+  double sparse_tflops_or_dense_equivalent_tflops = 0.0;
+  double speedup_vs_dense = 0.0;
+  double joules_per_dense_equivalent_flop = 0.0;
   std::string note;
 };
+
+Result make_base_result(const Options& options, int requested_sm_count) {
+  Result result;
+  result.dtype = options.dtype;
+  result.engine = options.engine;
+  result.m = options.m;
+  result.n = options.n;
+  result.k = options.k;
+  result.duty_cycle = options.duty_cycle;
+  result.active_sm_fraction = options.active_sm_fraction;
+  result.requested_sm_count = requested_sm_count;
+  result.steady_sec = options.steady_sec;
+  result.period_ms = options.period_ms;
+  result.blocks_per_sm = options.engine == "wmma_persistent" ? options.blocks_per_sm : 0;
+  result.mma_iters_per_loop =
+      options.engine == "wmma_persistent" ? options.mma_iters_per_loop : 0;
+  result.accumulators_per_warp =
+      options.engine == "wmma_persistent" ? options.accumulators_per_warp : 0;
+  result.atomic_period = options.engine == "wmma_persistent" ? options.atomic_period : 0;
+  result.sparsity_mode = options.sparsity_mode;
+  result.zero_ratio = options.zero_ratio;
+  result.zero_pattern = options.zero_pattern;
+  result.sparse_operand = options.sparse_operand;
+  result.sparse_engine =
+      options.sparsity_mode == "structured_2to4" ? options.sparse_engine : "";
+  result.sparse_pattern = options.sparsity_mode == "structured_2to4" ? "2:4" : "";
+  result.uses_sparse_tensor_core = false;
+  result.dense_mma_instruction_count_unchanged = options.sparsity_mode != "structured_2to4";
+  result.logical_m = options.m;
+  result.logical_n = options.n;
+  result.logical_k = options.k;
+  result.dense_equivalent_flops =
+      2.0 * static_cast<double>(options.m) * static_cast<double>(options.n) *
+      static_cast<double>(options.k);
+  return result;
+}
 
 void check_cuda(cudaError_t status, const char* call) {
   if (status != cudaSuccess) {
@@ -151,6 +213,16 @@ Options parse_args(int argc, char** argv) {
       options.accumulators_per_warp = parse_int(require_value(arg), arg);
     } else if (arg == "--atomic-period") {
       options.atomic_period = parse_int(require_value(arg), arg);
+    } else if (arg == "--sparsity-mode") {
+      options.sparsity_mode = require_value(arg);
+    } else if (arg == "--zero-ratio") {
+      options.zero_ratio = parse_double(require_value(arg), arg);
+    } else if (arg == "--zero-pattern") {
+      options.zero_pattern = require_value(arg);
+    } else if (arg == "--sparse-operand") {
+      options.sparse_operand = require_value(arg);
+    } else if (arg == "--sparse-engine") {
+      options.sparse_engine = require_value(arg);
     } else if (arg == "--help") {
       std::cout
           << "Usage: tensor_core_burn --device 0 --dtype bf16 "
@@ -159,13 +231,20 @@ Options parse_args(int argc, char** argv) {
           << "--period-ms 1000 --blocks-per-sm 1 "
           << "--mma-iters-per-loop 64 --accumulators-per-warp 1 "
           << "--atomic-period 1024 "
+          << "--sparsity-mode none|dense_zero|structured_2to4 "
+          << "--zero-ratio 0.0 --zero-pattern regular_k "
+          << "--sparse-operand A --sparse-engine cusparselt "
           << "--warmup-sec 30 --steady-sec 60\n\n"
           << "engine=cublas keeps the original cuBLAS GEMM active/idle windows.\n"
           << "engine=wmma_persistent launches persistent CTAs and controls "
           << "active/idle phases inside the CUDA kernel with clock64. "
           << "For wmma_persistent, --period-ms controls switching cadence while "
           << "--blocks-per-sm, --mma-iters-per-loop, and "
-          << "--accumulators-per-warp control active intensity.\n";
+          << "--accumulators-per-warp control active intensity.\n"
+          << "sparsity-mode=dense_zero inserts zero values into dense cuBLAS operands "
+          << "but does not use hardware sparse Tensor Cores.\n"
+          << "sparsity-mode=structured_2to4 requires a real sparse backend such as "
+          << "cuSPARSELt and fails if that backend is unavailable.\n";
       std::exit(0);
     } else {
       throw std::runtime_error("Unknown argument: " + arg);
@@ -203,6 +282,24 @@ Options parse_args(int argc, char** argv) {
   if (options.atomic_period <= 0) {
     throw std::runtime_error("--atomic-period must be > 0");
   }
+  if (options.sparsity_mode != "none" && options.sparsity_mode != "dense_zero" &&
+      options.sparsity_mode != "structured_2to4") {
+    throw std::runtime_error("--sparsity-mode must be none, dense_zero, or structured_2to4");
+  }
+  if (options.zero_ratio < 0.0 || options.zero_ratio >= 1.0) {
+    throw std::runtime_error("--zero-ratio must be in [0.0, 1.0)");
+  }
+  if (options.zero_pattern != "random" && options.zero_pattern != "regular_k" &&
+      options.zero_pattern != "block") {
+    throw std::runtime_error("--zero-pattern must be random, regular_k, or block");
+  }
+  if (options.sparse_operand != "A" && options.sparse_operand != "B" &&
+      options.sparse_operand != "both") {
+    throw std::runtime_error("--sparse-operand must be A, B, or both");
+  }
+  if (options.sparse_engine != "cusparselt" && options.sparse_engine != "cutlass_spgemm") {
+    throw std::runtime_error("--sparse-engine must be cusparselt or cutlass_spgemm");
+  }
   return options;
 }
 
@@ -226,20 +323,143 @@ class EventPair {
   cudaEvent_t stop_{};
 };
 
-__global__ void fill_bf16_kernel(__nv_bfloat16* data, std::size_t count, float value) {
+enum ZeroPattern {
+  kZeroPatternRandom = 0,
+  kZeroPatternRegularK = 1,
+  kZeroPatternBlock = 2,
+};
+
+int zero_pattern_id(const std::string& pattern) {
+  if (pattern == "random") {
+    return kZeroPatternRandom;
+  }
+  if (pattern == "regular_k") {
+    return kZeroPatternRegularK;
+  }
+  if (pattern == "block") {
+    return kZeroPatternBlock;
+  }
+  throw std::runtime_error("Unknown zero pattern: " + pattern);
+}
+
+bool operand_selected(const Options& options, const std::string& operand) {
+  return options.sparsity_mode == "dense_zero" &&
+         (options.sparse_operand == operand || options.sparse_operand == "both");
+}
+
+__device__ unsigned int hash_u32(unsigned int value) {
+  value ^= value >> 16;
+  value *= 0x7feb352dU;
+  value ^= value >> 15;
+  value *= 0x846ca68bU;
+  value ^= value >> 16;
+  return value;
+}
+
+__device__ bool should_zero_value(
+    int k_index,
+    int other_index,
+    int k_extent,
+    double zero_ratio,
+    int zero_pattern) {
+  if (zero_ratio <= 0.0) {
+    return false;
+  }
+
+  if (zero_pattern == kZeroPatternBlock) {
+    int zero_count = static_cast<int>(zero_ratio * static_cast<double>(k_extent));
+    return k_index < zero_count;
+  }
+
+  if (zero_pattern == kZeroPatternRegularK) {
+    constexpr int period = 1024;
+    int zero_count = static_cast<int>(zero_ratio * static_cast<double>(period));
+    return (k_index % period) < zero_count;
+  }
+
+  unsigned int mixed = hash_u32(
+      static_cast<unsigned int>(k_index) * 1315423911U ^
+      static_cast<unsigned int>(other_index) * 2654435761U);
+  double unit = static_cast<double>(mixed) / static_cast<double>(0xffffffffU);
+  return unit < zero_ratio;
+}
+
+bool should_zero_host(
+    int k_index,
+    int other_index,
+    int k_extent,
+    double zero_ratio,
+    int zero_pattern) {
+  if (zero_ratio <= 0.0) {
+    return false;
+  }
+  if (zero_pattern == kZeroPatternBlock) {
+    int zero_count = static_cast<int>(zero_ratio * static_cast<double>(k_extent));
+    return k_index < zero_count;
+  }
+  if (zero_pattern == kZeroPatternRegularK) {
+    constexpr int period = 1024;
+    int zero_count = static_cast<int>(zero_ratio * static_cast<double>(period));
+    return (k_index % period) < zero_count;
+  }
+  unsigned int mixed =
+      static_cast<unsigned int>(k_index) * 1315423911U ^
+      static_cast<unsigned int>(other_index) * 2654435761U;
+  mixed ^= mixed >> 16;
+  mixed *= 0x7feb352dU;
+  mixed ^= mixed >> 15;
+  mixed *= 0x846ca68bU;
+  mixed ^= mixed >> 16;
+  double unit = static_cast<double>(mixed) / static_cast<double>(0xffffffffU);
+  return unit < zero_ratio;
+}
+
+__global__ void fill_bf16_kernel(
+    __nv_bfloat16* data,
+    int rows,
+    int cols,
+    int k_extent,
+    int k_axis_is_row,
+    double zero_ratio,
+    int zero_pattern,
+    float value) {
+  std::size_t count = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
   std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   std::size_t stride = blockDim.x * gridDim.x;
   __nv_bfloat16 converted = __float2bfloat16(value);
   while (index < count) {
-    data[index] = converted;
+    int row = static_cast<int>(index % static_cast<std::size_t>(rows));
+    int col = static_cast<int>(index / static_cast<std::size_t>(rows));
+    int k_index = k_axis_is_row ? row : col;
+    int other_index = k_axis_is_row ? col : row;
+    data[index] = should_zero_value(k_index, other_index, k_extent, zero_ratio, zero_pattern)
+                      ? __float2bfloat16(0.0f)
+                      : converted;
     index += stride;
   }
 }
 
-void fill_bf16(__nv_bfloat16* data, std::size_t count, float value) {
+void fill_bf16(
+    __nv_bfloat16* data,
+    int rows,
+    int cols,
+    int k_extent,
+    bool k_axis_is_row,
+    double zero_ratio,
+    int zero_pattern,
+    float value) {
   int threads = 256;
+  std::size_t count = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
   int blocks = static_cast<int>(std::min<std::size_t>((count + threads - 1) / threads, 65535));
-  fill_bf16_kernel<<<blocks, threads>>>(data, count, value);
+  fill_bf16_kernel<<<blocks, threads>>>(
+      data,
+      rows,
+      cols,
+      k_extent,
+      k_axis_is_row ? 1 : 0,
+      zero_ratio,
+      zero_pattern,
+      value);
   check_cuda(cudaGetLastError(), "fill_bf16_kernel");
 }
 
@@ -294,6 +514,56 @@ void run_active_window(
   }
 }
 
+struct CorrectnessSmoke {
+  bool passed = false;
+  double reference = 0.0;
+  double observed = 0.0;
+  double abs_error = 0.0;
+};
+
+float dense_zero_operand_value(
+    const Options& options,
+    const std::string& operand,
+    int k_index,
+    int other_index) {
+  if (!operand_selected(options, operand)) {
+    return 1.0f;
+  }
+  return should_zero_host(
+             k_index,
+             other_index,
+             options.k,
+             options.zero_ratio,
+             zero_pattern_id(options.zero_pattern))
+             ? 0.0f
+             : 1.0f;
+}
+
+CorrectnessSmoke run_correctness_smoke(
+    cublasHandle_t handle,
+    const Options& options,
+    const __nv_bfloat16* a,
+    const __nv_bfloat16* b,
+    float* c) {
+  CorrectnessSmoke smoke;
+  if (options.sparsity_mode != "dense_zero") {
+    return smoke;
+  }
+
+  run_gemm(handle, options, a, b, c);
+  check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(correctness smoke)");
+  check_cuda(cudaMemcpy(&smoke.observed, c, sizeof(float), cudaMemcpyDeviceToHost),
+             "cudaMemcpy(correctness smoke)");
+
+  for (int kk = 0; kk < options.k; ++kk) {
+    smoke.reference += static_cast<double>(dense_zero_operand_value(options, "A", kk, 0)) *
+                       static_cast<double>(dense_zero_operand_value(options, "B", kk, 0));
+  }
+  smoke.abs_error = std::abs(smoke.observed - smoke.reference);
+  smoke.passed = smoke.abs_error <= std::max(1.0, std::abs(smoke.reference)) * 1.0e-2;
+  return smoke;
+}
+
 Result measure_cublas(
     cublasHandle_t handle,
     const Options& options,
@@ -301,42 +571,29 @@ Result measure_cublas(
     const __nv_bfloat16* b,
     float* c,
     int requested_sm_count,
-    bool sm_count_target_applied) {
+    bool sm_count_target_applied,
+    const CorrectnessSmoke& correctness_smoke) {
   std::uint64_t warmup_iterations = 0;
   run_active_window(handle, options, a, b, c, options.warmup_sec, warmup_iterations);
   check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(warmup)");
 
   if (options.duty_cycle == 0.0) {
     std::this_thread::sleep_for(std::chrono::duration<double>(options.steady_sec));
-    return Result{
-        options.dtype,
-        options.engine,
-        options.m,
-        options.n,
-        options.k,
-        options.duty_cycle,
-        options.active_sm_fraction,
-        requested_sm_count,
-        options.steady_sec,
-        0.0,
-        0,
-        0.0,
-        0.0,
-        options.period_ms,
-        options.steady_sec * 1000.0,
-        "cpu_windowed_cublas",
-        "cublas_sm_count_target",
-        sm_count_target_applied,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        false,
-        "cuBLAS engine preserves the original CPU-controlled active/idle window behavior.",
-    };
+    Result result = make_base_result(options, requested_sm_count);
+    result.actual_elapsed_ms = options.steady_sec * 1000.0;
+    result.duty_control_mode = "cpu_windowed_cublas";
+    result.spatial_control_mode = "cublas_sm_count_target";
+    result.sm_count_target_applied = sm_count_target_applied;
+    result.correctness_smoke_passed = correctness_smoke.passed;
+    result.correctness_reference = correctness_smoke.reference;
+    result.correctness_observed = correctness_smoke.observed;
+    result.correctness_abs_error = correctness_smoke.abs_error;
+    result.note = "cuBLAS engine preserves the original CPU-controlled active/idle window behavior.";
+    if (options.sparsity_mode == "dense_zero") {
+      result.note +=
+          " dense_zero inserts zero values into dense operands and does not use hardware sparse Tensor Cores.";
+    }
+    return result;
   }
 
   EventPair events;
@@ -367,35 +624,30 @@ Result measure_cublas(
       static_cast<double>(options.k);
   const double active_elapsed_s = std::max(static_cast<double>(elapsed_ms) / 1000.0, 1e-9);
   const double total_ops = gemm_ops * static_cast<double>(iterations);
-  return Result{
-      options.dtype,
-      options.engine,
-      options.m,
-      options.n,
-      options.k,
-      options.duty_cycle,
-      options.active_sm_fraction,
-      requested_sm_count,
-      options.steady_sec,
-      static_cast<double>(elapsed_ms),
-      iterations,
-      total_ops / active_elapsed_s / 1.0e12,
-      total_ops / options.steady_sec / 1.0e12,
-      options.period_ms,
-      static_cast<double>(elapsed_ms),
-      "cpu_windowed_cublas",
-      "cublas_sm_count_target",
-      sm_count_target_applied,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      false,
-      "cuBLAS active_sm_fraction is a cuBLAS SM-count target hint; validate actual activity with profiler metrics.",
-  };
+  Result result = make_base_result(options, requested_sm_count);
+  result.active_elapsed_ms = static_cast<double>(elapsed_ms);
+  result.iterations = iterations;
+  result.active_tflops = total_ops / active_elapsed_s / 1.0e12;
+  result.scheduled_tflops = total_ops / options.steady_sec / 1.0e12;
+  result.actual_elapsed_ms = static_cast<double>(elapsed_ms);
+  result.measured_runtime_ms = static_cast<double>(elapsed_ms);
+  result.dense_baseline_tflops = result.scheduled_tflops;
+  result.sparse_tflops_or_dense_equivalent_tflops = result.scheduled_tflops;
+  result.speedup_vs_dense = 1.0;
+  result.duty_control_mode = "cpu_windowed_cublas";
+  result.spatial_control_mode = "cublas_sm_count_target";
+  result.sm_count_target_applied = sm_count_target_applied;
+  result.correctness_smoke_passed = correctness_smoke.passed;
+  result.correctness_reference = correctness_smoke.reference;
+  result.correctness_observed = correctness_smoke.observed;
+  result.correctness_abs_error = correctness_smoke.abs_error;
+  result.note =
+      "cuBLAS active_sm_fraction is a cuBLAS SM-count target hint; validate actual activity with profiler metrics.";
+  if (options.sparsity_mode == "dense_zero") {
+    result.note +=
+        " dense_zero inserts zero values into dense operands and does not use hardware sparse Tensor Cores; dense MMA instruction count is unchanged.";
+  }
+  return result;
 }
 
 // Accumulator count is compile-time specialized so variants with 1, 2, or 4
@@ -670,35 +922,27 @@ Result measure_wmma_persistent(
     cudaFree(output);
     cudaFree(iteration_counter);
 
-    return Result{
-        options.dtype,
-        options.engine,
-        options.m,
-        options.n,
-        options.k,
-        options.duty_cycle,
-        options.active_sm_fraction,
-        requested_sm_count,
-        options.steady_sec,
-        active_elapsed_ms,
-        host_iterations,
-        total_ops / active_elapsed_s / 1.0e12,
-        total_ops / options.steady_sec / 1.0e12,
-        options.period_ms,
-        static_cast<double>(elapsed_ms),
-        "device_clock64_persistent_kernel",
-        "persistent_cta_count",
-        false,
-        grid_blocks,
-        blocks_per_sm,
-        options.mma_iters_per_loop,
-        options.accumulators_per_warp,
-        options.atomic_period,
-        occupancy_max_active_blocks_per_sm,
-        effective_blocks_per_sm_estimate,
-        occupancy_limited,
-        "wmma_persistent uses m/n/k as nominal reporting parameters; actual MAC pressure is controlled by blocks_per_sm, mma_iters_per_loop, accumulators_per_warp, atomic_period, active_sm_fraction, duty_cycle, and period_ms. blocks_per_sm is requested launch density; actual resident CTA count is bounded by occupancy. Validate Tensor Core utilization with Nsight profiler metrics.",
-    };
+    Result result = make_base_result(options, requested_sm_count);
+    result.active_elapsed_ms = active_elapsed_ms;
+    result.iterations = host_iterations;
+    result.active_tflops = total_ops / active_elapsed_s / 1.0e12;
+    result.scheduled_tflops = total_ops / options.steady_sec / 1.0e12;
+    result.actual_elapsed_ms = static_cast<double>(elapsed_ms);
+    result.measured_runtime_ms = static_cast<double>(elapsed_ms);
+    result.sparse_tflops_or_dense_equivalent_tflops = result.scheduled_tflops;
+    result.duty_control_mode = "device_clock64_persistent_kernel";
+    result.spatial_control_mode = "persistent_cta_count";
+    result.grid_blocks = grid_blocks;
+    result.blocks_per_sm = blocks_per_sm;
+    result.mma_iters_per_loop = options.mma_iters_per_loop;
+    result.accumulators_per_warp = options.accumulators_per_warp;
+    result.atomic_period = options.atomic_period;
+    result.occupancy_max_active_blocks_per_sm = occupancy_max_active_blocks_per_sm;
+    result.effective_blocks_per_sm_estimate = effective_blocks_per_sm_estimate;
+    result.occupancy_limited = occupancy_limited;
+    result.note =
+        "wmma_persistent uses m/n/k as nominal reporting parameters; actual MAC pressure is controlled by blocks_per_sm, mma_iters_per_loop, accumulators_per_warp, atomic_period, active_sm_fraction, duty_cycle, and period_ms. blocks_per_sm is requested launch density; actual resident CTA count is bounded by occupancy. Validate Tensor Core utilization with Nsight profiler metrics.";
+    return result;
   } catch (...) {
     cudaFree(output);
     cudaFree(iteration_counter);
@@ -739,6 +983,32 @@ void print_json(const Result& result) {
             << result.effective_blocks_per_sm_estimate << ","
             << "\"occupancy_limited\":"
             << (result.occupancy_limited ? "true" : "false") << ","
+            << "\"sparsity_mode\":\"" << result.sparsity_mode << "\","
+            << "\"zero_ratio\":" << result.zero_ratio << ","
+            << "\"zero_pattern\":\"" << result.zero_pattern << "\","
+            << "\"sparse_operand\":\"" << result.sparse_operand << "\","
+            << "\"sparse_engine\":\"" << result.sparse_engine << "\","
+            << "\"sparse_pattern\":\"" << result.sparse_pattern << "\","
+            << "\"uses_sparse_tensor_core\":"
+            << (result.uses_sparse_tensor_core ? "true" : "false") << ","
+            << "\"dense_mma_instruction_count_unchanged\":"
+            << (result.dense_mma_instruction_count_unchanged ? "true" : "false") << ","
+            << "\"correctness_smoke_passed\":"
+            << (result.correctness_smoke_passed ? "true" : "false") << ","
+            << "\"correctness_reference\":" << result.correctness_reference << ","
+            << "\"correctness_observed\":" << result.correctness_observed << ","
+            << "\"correctness_abs_error\":" << result.correctness_abs_error << ","
+            << "\"logical_m\":" << result.logical_m << ","
+            << "\"logical_n\":" << result.logical_n << ","
+            << "\"logical_k\":" << result.logical_k << ","
+            << "\"dense_equivalent_flops\":" << result.dense_equivalent_flops << ","
+            << "\"measured_runtime_ms\":" << result.measured_runtime_ms << ","
+            << "\"dense_baseline_tflops\":" << result.dense_baseline_tflops << ","
+            << "\"sparse_tflops_or_dense_equivalent_tflops\":"
+            << result.sparse_tflops_or_dense_equivalent_tflops << ","
+            << "\"speedup_vs_dense\":" << result.speedup_vs_dense << ","
+            << "\"joules_per_dense_equivalent_flop\":"
+            << result.joules_per_dense_equivalent_flop << ","
             << "\"note\":\"" << result.note << "\""
             << "}" << std::endl;
 }
@@ -759,6 +1029,19 @@ int main(int argc, char** argv) {
     check_cuda(cudaGetDeviceProperties(&prop, options.device), "cudaGetDeviceProperties");
     const int requested_sm_count = std::max(
         1, static_cast<int>(std::ceil(prop.multiProcessorCount * options.active_sm_fraction)));
+
+    if (options.sparsity_mode == "structured_2to4") {
+      throw std::runtime_error(
+          "sparsity-mode=structured_2to4 requires a real sparse Tensor Core backend "
+          "(cuSPARSELt or CUTLASS SparseGemm) that is not enabled in this build; "
+          "refusing to fall back to dense_zero or dense GEMM");
+    }
+
+    if (options.engine == "wmma_persistent" && options.sparsity_mode == "dense_zero") {
+      throw std::runtime_error(
+          "sparsity-mode=dense_zero is implemented for engine=cublas dense operands; "
+          "wmma_persistent uses synthetic WMMA fragments and does not consume initialized A/B operands");
+    }
 
     if (options.engine == "wmma_persistent") {
       Result result = measure_wmma_persistent(options, prop, requested_sm_count);
@@ -784,13 +1067,31 @@ int main(int argc, char** argv) {
                "cudaMalloc(b)");
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&c), c_count * sizeof(float)),
                "cudaMalloc(c)");
-    fill_bf16(a, a_count, 1.0f);
-    fill_bf16(b, b_count, 1.0f);
+    const int pattern_id = zero_pattern_id(options.zero_pattern);
+    fill_bf16(
+        a,
+        options.m,
+        options.k,
+        options.k,
+        false,
+        operand_selected(options, "A") ? options.zero_ratio : 0.0,
+        pattern_id,
+        1.0f);
+    fill_bf16(
+        b,
+        options.k,
+        options.n,
+        options.k,
+        true,
+        operand_selected(options, "B") ? options.zero_ratio : 0.0,
+        pattern_id,
+        1.0f);
     check_cuda(cudaMemset(c, 0, c_count * sizeof(float)), "cudaMemset(c)");
     check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(init)");
 
+    CorrectnessSmoke correctness_smoke = run_correctness_smoke(handle, options, a, b, c);
     Result result = measure_cublas(
-        handle, options, a, b, c, requested_sm_count, sm_count_target_applied);
+        handle, options, a, b, c, requested_sm_count, sm_count_target_applied, correctness_smoke);
     print_json(result);
 
     cublasDestroy(handle);

@@ -232,6 +232,16 @@ active/idle switching cadence; `--blocks-per-sm`, `--mma-iters-per-loop`, and
 validate actual SM activity and Tensor Core utilization with Nsight profiler
 metrics on the H100 server.
 
+Sparsity is a separate test axis from active-SM coverage. Dense-zero sparsity
+uses dense Tensor Core instructions with zero-filled operands:
+
+```bash
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --sparsity-mode dense_zero --zero-ratio 0.5 --zero-pattern regular_k --sparse-operand A --warmup-sec 5 --steady-sec 10
+```
+
+True 2:4 structured sparsity requires a real sparse backend such as cuSPARSELt;
+the workload fails clearly if that backend is not enabled.
+
 `nvbandwidth` can be built separately from `third_party/nvbandwidth` and used as
 a cross-check, but the primary IO cases do not depend on it and this framework
 does not modify `third_party`.
