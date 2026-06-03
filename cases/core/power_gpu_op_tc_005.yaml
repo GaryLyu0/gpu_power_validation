@@ -47,9 +47,10 @@ parameters:
   sweep:
     sparse_engine:
       - {label: "cusparselt", value: cusparselt}
-      - {label: "cutlass_spgemm", value: cutlass_spgemm}
     sparse_pattern: "2:4"
     dense_baseline: same_logical_shape_and_expanded_sparse_operand_values
+  future_backends:
+    - cutlass_spgemm
 telemetry:
   sampler: mock_nvml
   interval_ms: 500
@@ -78,12 +79,14 @@ expected:
     - speedup_vs_dense
     - joules_per_dense_equivalent_flop
   pass_criteria:
-    - Summary JSON reports uses_sparse_tensor_core=true for implemented sparse backends.
-    - Summary JSON reports sparse_pattern="2:4" and the selected sparse_engine.
+    - tensor_core_burn is built with HAVE_CUSPARSELT enabled and linked with libcusparseLt.
+    - Summary JSON reports uses_sparse_tensor_core=true for sparse_engine=cusparselt.
+    - Summary JSON reports sparse_pattern="2:4" and sparse_engine="cusparselt".
     - Dense baseline uses the same logical M/N/K shape and expanded sparse operand values.
-    - If no backend is available, the workload fails clearly instead of silently falling back to dense_zero.
+    - If cuSPARSELt is unavailable, the workload fails clearly instead of silently falling back to dense_zero.
 notes:
   - This case is reserved for true hardware sparse Tensor Core execution.
   - The cusparselt backend prunes/checks operand A, compresses it, and repeatedly calls cusparseLtMatmul during the steady window.
   - If tensor_core_burn is built without cuSPARSELt support, this case fails clearly instead of falling back to dense execution.
+  - CUTLASS SparseGemm is a future backend and is intentionally not included in the normal sweep yet.
   - Use power_gpu_op_tc_004 for dense-zero data-pattern testing under dense Tensor Core execution.
