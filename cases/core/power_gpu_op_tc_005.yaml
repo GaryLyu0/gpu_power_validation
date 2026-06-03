@@ -8,7 +8,7 @@ platform:
   gpus: [0]
 preconditions:
   - Tensor Core sparse GEMM backend is built on the target H100/B200 server.
-  - Preferred backend order is cuSPARSELt first, then CUTLASS SparseGemm if enabled.
+  - cuSPARSELt headers and libcusparseLt are available when building tensor_core_burn.
   - Sparse operand uses a valid NVIDIA 2:4 structured sparsity pattern along K.
   - Compression and pruning are prepared outside the steady-state power window unless explicitly enabled later.
 workload:
@@ -84,5 +84,6 @@ expected:
     - If no backend is available, the workload fails clearly instead of silently falling back to dense_zero.
 notes:
   - This case is reserved for true hardware sparse Tensor Core execution.
-  - Current workload scaffolding accepts the structured_2to4 CLI and fails clearly until cuSPARSELt or CUTLASS SparseGemm integration is enabled on H100/B200.
+  - The cusparselt backend prunes/checks operand A, compresses it, and repeatedly calls cusparseLtMatmul during the steady window.
+  - If tensor_core_burn is built without cuSPARSELt support, this case fails clearly instead of falling back to dense execution.
   - Use power_gpu_op_tc_004 for dense-zero data-pattern testing under dense Tensor Core execution.

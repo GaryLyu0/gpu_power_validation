@@ -47,6 +47,28 @@ target_link_libraries(sm_issue_coverage PRIVATE CUDA::cudart)
 target_link_libraries(tma_copy PRIVATE CUDA::cudart)
 target_link_libraries(tensor_core_burn PRIVATE CUDA::cublas)
 
+find_path(
+  CUSPARSELT_INCLUDE_DIR
+  NAMES cusparseLt.h
+  HINTS ENV CUSPARSELT_ROOT
+  PATH_SUFFIXES include
+)
+find_library(
+  CUSPARSELT_LIBRARY
+  NAMES cusparseLt
+  HINTS ENV CUSPARSELT_ROOT
+  PATH_SUFFIXES lib lib64
+)
+
+if(CUSPARSELT_INCLUDE_DIR AND CUSPARSELT_LIBRARY)
+  target_include_directories(tensor_core_burn PRIVATE "${CUSPARSELT_INCLUDE_DIR}")
+  target_link_libraries(tensor_core_burn PRIVATE "${CUSPARSELT_LIBRARY}")
+  target_compile_definitions(tensor_core_burn PRIVATE HAVE_CUSPARSELT=1)
+  message(STATUS "cuSPARSELt enabled for tensor_core_burn: ${CUSPARSELT_LIBRARY}")
+else()
+  message(STATUS "cuSPARSELt not found; structured_2to4 mode will fail clearly at runtime")
+endif()
+
 if(GPU_POWER_ENABLE_EXPERIMENTAL_TMA)
   target_compile_definitions(tma_copy PRIVATE GPU_POWER_ENABLE_EXPERIMENTAL_TMA=1)
 endif()

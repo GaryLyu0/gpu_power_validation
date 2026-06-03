@@ -19,6 +19,14 @@ Build on the H100/B200 server:
 CUDA_ARCHITECTURES=90 bash scripts/build_workloads.sh
 ```
 
+If cuSPARSELt is installed outside the CUDA Toolkit search path, point CMake at
+it before building `power_gpu_op_tc_005` support:
+
+```bash
+export CUSPARSELT_ROOT=/path/to/cusparselt
+CUDA_ARCHITECTURES=90 bash scripts/build_workloads.sh
+```
+
 Override architectures when needed:
 
 ```bash
@@ -81,9 +89,9 @@ Current Tensor Core limitations:
   effects, not true sparse Tensor Core execution. This maps to
   `power_gpu_op_tc_004`.
 - `--sparsity-mode structured_2to4` is reserved for real 2:4 sparse Tensor Core
-  execution through a backend such as cuSPARSELt or CUTLASS SparseGemm. If the
-  backend is not available, the workload fails clearly rather than falling back
-  to dense execution. This maps to `power_gpu_op_tc_005`.
+  execution through cuSPARSELt when `cusparseLt.h` and `libcusparseLt` are found
+  at build time. If cuSPARSELt is not available, the workload fails clearly
+  rather than falling back to dense execution. This maps to `power_gpu_op_tc_005`.
 - `power_gpu_op_tc_001` remains the active SM spatial coverage test. It varies
   `--active-sm-fraction`; it must not be implemented by inserting zeros into
   input matrices.
@@ -99,6 +107,12 @@ The dimensions are related but not interchangeable:
   under unchanged dense MMA instruction execution.
 - 2:4 structured sparsity measures true sparse Tensor Core execution with a
   valid NVIDIA 2:4 sparse pattern and a sparse GEMM backend.
+
+For `structured_2to4 --sparse-engine cusparselt`, setup creates dense A/B
+buffers, prunes/checks A into a valid 2:4 pattern with cuSPARSELt, compresses A,
+measures a short dense cuBLAS baseline using the expanded pruned A and same B,
+then repeatedly calls `cusparseLtMatmul` during the sparse steady window.
+Prune/compression/setup time is excluded from `measured_runtime_ms`.
 
 ```bash
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --warmup-sec 30 --steady-sec 60

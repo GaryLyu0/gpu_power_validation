@@ -263,8 +263,9 @@ Dense-zero data-pattern example. Summary JSON reports
 
 True 2:4 structured sparse example. Summary JSON for an implemented backend
 must report `uses_sparse_tensor_core=true`, `sparse_pattern="2:4"`, and the
-selected `sparse_engine`. The current scaffold fails clearly if the backend is
-not enabled:
+selected `sparse_engine`. This path requires `cusparseLt.h` and `libcusparseLt`
+at build time; without them, the binary fails clearly instead of falling back to
+dense execution:
 
 ```bash
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --sparsity-mode structured_2to4 --sparse-engine cusparselt --warmup-sec 5 --steady-sec 10

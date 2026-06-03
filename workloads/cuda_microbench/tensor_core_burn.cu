@@ -2,6 +2,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
+#if defined(HAVE_CUSPARSELT)
+#include <cusparseLt.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -93,6 +96,8 @@ struct Result {
   double sparse_tflops_or_dense_equivalent_tflops = 0.0;
   double speedup_vs_dense = 0.0;
   double joules_per_dense_equivalent_flop = 0.0;
+  bool compression_time_excluded = false;
+  bool setup_time_excluded = false;
   std::string note;
 };
 
@@ -121,7 +126,7 @@ Result make_base_result(const Options& options, int requested_sm_count) {
   result.sparse_engine =
       options.sparsity_mode == "structured_2to4" ? options.sparse_engine : "";
   result.sparse_pattern = options.sparsity_mode == "structured_2to4" ? "2:4" : "";
-  result.uses_sparse_tensor_core = options.sparsity_mode == "structured_2to4";
+  result.uses_sparse_tensor_core = false;
   result.dense_mma_instruction_count_unchanged = options.sparsity_mode != "structured_2to4";
   result.spatial_coverage_fraction = options.active_sm_fraction;
   if (options.sparsity_mode == "dense_zero") {
@@ -154,6 +159,16 @@ void check_cublas(cublasStatus_t status, const char* call) {
     throw std::runtime_error(message.str());
   }
 }
+
+#if defined(HAVE_CUSPARSELT)
+void check_cusparselt(cusparseStatus_t status, const char* call) {
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    std::ostringstream message;
+    message << call << " failed with cusparseStatus_t=" << static_cast<int>(status);
+    throw std::runtime_error(message.str());
+  }
+}
+#endif
 
 double parse_double(const std::string& value, const std::string& name) {
   char* end = nullptr;
@@ -660,6 +675,374 @@ Result measure_cublas(
   return result;
 }
 
+#if defined(HAVE_CUSPARSELT)
+struct SparseCusparseLtState {
+  cusparseLtHandle_t handle{};
+  cusparseLtMatDescriptor_t mat_a{};
+  cusparseLtMatDescriptor_t mat_b{};
+  cusparseLtMatDescriptor_t mat_c{};
+  cusparseLtMatDescriptor_t mat_d{};
+  cusparseLtMatmulDescriptor_t matmul{};
+  cusparseLtMatmulAlgSelection_t alg_selection{};
+  cusparseLtMatmulPlan_t plan{};
+  cudaStream_t stream{};
+  void* workspace = nullptr;
+  void* compressed_a = nullptr;
+  void* compressed_buffer = nullptr;
+  __nv_bfloat16* pruned_a = nullptr;
+  int* d_valid = nullptr;
+  std::size_t workspace_size = 0;
+  std::size_t compressed_size = 0;
+  std::size_t compressed_buffer_size = 0;
+  bool handle_initialized = false;
+  bool stream_initialized = false;
+  bool mat_a_initialized = false;
+  bool mat_b_initialized = false;
+  bool mat_c_initialized = false;
+  bool mat_d_initialized = false;
+  bool plan_initialized = false;
+};
+
+void destroy_sparse_cusparselt_state(SparseCusparseLtState& state) {
+  cudaFree(state.workspace);
+  cudaFree(state.compressed_a);
+  cudaFree(state.compressed_buffer);
+  cudaFree(state.pruned_a);
+  cudaFree(state.d_valid);
+  if (state.stream_initialized) {
+    cudaStreamDestroy(state.stream);
+  }
+  if (state.plan_initialized) {
+    cusparseLtMatmulPlanDestroy(&state.plan);
+  }
+  if (state.mat_a_initialized) {
+    cusparseLtMatDescriptorDestroy(&state.mat_a);
+  }
+  if (state.mat_b_initialized) {
+    cusparseLtMatDescriptorDestroy(&state.mat_b);
+  }
+  if (state.mat_c_initialized) {
+    cusparseLtMatDescriptorDestroy(&state.mat_c);
+  }
+  if (state.mat_d_initialized) {
+    cusparseLtMatDescriptorDestroy(&state.mat_d);
+  }
+  if (state.handle_initialized) {
+    cusparseLtDestroy(&state.handle);
+  }
+}
+
+SparseCusparseLtState prepare_sparse_cusparselt_state(
+    const Options& options,
+    const __nv_bfloat16* dense_a,
+    const __nv_bfloat16* dense_b) {
+  (void)dense_b;
+  SparseCusparseLtState state;
+  try {
+    check_cuda(cudaStreamCreate(&state.stream), "cudaStreamCreate(cusparselt)");
+    state.stream_initialized = true;
+    check_cusparselt(cusparseLtInit(&state.handle), "cusparseLtInit");
+    state.handle_initialized = true;
+
+    constexpr int kAlignment = 16;
+    check_cusparselt(
+        cusparseLtStructuredDescriptorInit(
+            &state.handle,
+            &state.mat_a,
+            options.m,
+            options.k,
+            options.m,
+            kAlignment,
+            CUDA_R_16BF,
+            CUSPARSE_ORDER_COL,
+            CUSPARSELT_SPARSITY_50_PERCENT),
+        "cusparseLtStructuredDescriptorInit(A)");
+    state.mat_a_initialized = true;
+    check_cusparselt(
+        cusparseLtDenseDescriptorInit(
+            &state.handle,
+            &state.mat_b,
+            options.k,
+            options.n,
+            options.k,
+            kAlignment,
+            CUDA_R_16BF,
+            CUSPARSE_ORDER_COL),
+        "cusparseLtDenseDescriptorInit(B)");
+    state.mat_b_initialized = true;
+    check_cusparselt(
+        cusparseLtDenseDescriptorInit(
+            &state.handle,
+            &state.mat_c,
+            options.m,
+            options.n,
+            options.m,
+            kAlignment,
+            CUDA_R_32F,
+            CUSPARSE_ORDER_COL),
+        "cusparseLtDenseDescriptorInit(C)");
+    state.mat_c_initialized = true;
+    check_cusparselt(
+        cusparseLtDenseDescriptorInit(
+            &state.handle,
+            &state.mat_d,
+            options.m,
+            options.n,
+            options.m,
+            kAlignment,
+            CUDA_R_32F,
+            CUSPARSE_ORDER_COL),
+        "cusparseLtDenseDescriptorInit(D)");
+    state.mat_d_initialized = true;
+    check_cusparselt(
+        cusparseLtMatmulDescriptorInit(
+            &state.handle,
+            &state.matmul,
+            CUSPARSE_OPERATION_NON_TRANSPOSE,
+            CUSPARSE_OPERATION_NON_TRANSPOSE,
+            &state.mat_a,
+            &state.mat_b,
+            &state.mat_c,
+            &state.mat_d,
+            CUSPARSE_COMPUTE_32F),
+        "cusparseLtMatmulDescriptorInit");
+    check_cusparselt(
+        cusparseLtMatmulAlgSelectionInit(
+            &state.handle,
+            &state.alg_selection,
+            &state.matmul,
+            CUSPARSELT_MATMUL_ALG_DEFAULT),
+        "cusparseLtMatmulAlgSelectionInit");
+    check_cusparselt(
+        cusparseLtMatmulPlanInit(&state.handle, &state.plan, &state.matmul, &state.alg_selection),
+        "cusparseLtMatmulPlanInit");
+    state.plan_initialized = true;
+    check_cusparselt(
+        cusparseLtMatmulGetWorkspace(&state.handle, &state.plan, &state.workspace_size),
+        "cusparseLtMatmulGetWorkspace");
+    check_cusparselt(
+        cusparseLtSpMMACompressedSize(
+            &state.handle,
+            &state.plan,
+            &state.compressed_size,
+            &state.compressed_buffer_size),
+        "cusparseLtSpMMACompressedSize");
+
+    if (state.workspace_size > 0) {
+      check_cuda(cudaMalloc(&state.workspace, state.workspace_size), "cudaMalloc(workspace)");
+    }
+    check_cuda(cudaMalloc(&state.compressed_a, state.compressed_size),
+               "cudaMalloc(compressed_a)");
+    if (state.compressed_buffer_size > 0) {
+      check_cuda(cudaMalloc(&state.compressed_buffer, state.compressed_buffer_size),
+                 "cudaMalloc(compressed_buffer)");
+    }
+
+    const std::size_t a_count = static_cast<std::size_t>(options.m) * options.k;
+    check_cuda(
+        cudaMalloc(reinterpret_cast<void**>(&state.pruned_a), a_count * sizeof(__nv_bfloat16)),
+        "cudaMalloc(pruned_a)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&state.d_valid), sizeof(int)),
+               "cudaMalloc(d_valid)");
+
+    check_cusparselt(
+        cusparseLtSpMMAPrune(
+            &state.handle,
+            &state.matmul,
+            dense_a,
+            state.pruned_a,
+            CUSPARSELT_PRUNE_SPMMA_TILE,
+            state.stream),
+        "cusparseLtSpMMAPrune(A)");
+    check_cusparselt(
+        cusparseLtSpMMAPruneCheck(
+            &state.handle,
+            &state.matmul,
+            state.pruned_a,
+            state.d_valid,
+            state.stream),
+        "cusparseLtSpMMAPruneCheck(A)");
+    int h_valid = 0;
+    check_cuda(
+        cudaMemcpyAsync(&h_valid, state.d_valid, sizeof(int), cudaMemcpyDeviceToHost, state.stream),
+        "cudaMemcpyAsync(prune check)");
+    check_cuda(cudaStreamSynchronize(state.stream), "cudaStreamSynchronize(prune)");
+    if (h_valid != 0) {
+      throw std::runtime_error("cuSPARSELt prune check failed for A 2:4 pattern");
+    }
+
+    check_cusparselt(
+        cusparseLtSpMMACompress(
+            &state.handle,
+            &state.plan,
+            state.pruned_a,
+            state.compressed_a,
+            state.compressed_buffer,
+            state.stream),
+        "cusparseLtSpMMACompress(A)");
+    check_cuda(cudaStreamSynchronize(state.stream), "cudaStreamSynchronize(compress)");
+    return state;
+  } catch (...) {
+    destroy_sparse_cusparselt_state(state);
+    throw;
+  }
+}
+
+void run_sparse_cusparselt_gemm(
+    SparseCusparseLtState& state,
+    const __nv_bfloat16* b,
+    float* c) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  cudaStream_t streams[] = {state.stream};
+  check_cusparselt(
+      cusparseLtMatmul(
+          &state.handle,
+          &state.plan,
+          &alpha,
+          state.compressed_a,
+          b,
+          &beta,
+          c,
+          c,
+          state.workspace,
+          streams,
+          1),
+      "cusparseLtMatmul");
+}
+
+void run_sparse_active_window(
+    SparseCusparseLtState& state,
+    const Options& options,
+    const __nv_bfloat16* b,
+    float* c,
+    double seconds,
+    std::uint64_t& iterations) {
+  if (seconds <= 0.0) {
+    return;
+  }
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::duration<double>(seconds);
+  while (std::chrono::steady_clock::now() < deadline) {
+    run_sparse_cusparselt_gemm(state, b, c);
+    ++iterations;
+  }
+}
+
+double measure_dense_baseline_tflops(
+    cublasHandle_t handle,
+    const Options& options,
+    const __nv_bfloat16* pruned_a,
+    const __nv_bfloat16* b,
+    float* c) {
+  constexpr int kBaselineIterations = 3;
+  run_gemm(handle, options, pruned_a, b, c);
+  check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(dense baseline warmup)");
+
+  EventPair events;
+  check_cuda(cudaEventRecord(events.start()), "cudaEventRecord(dense baseline start)");
+  for (int index = 0; index < kBaselineIterations; ++index) {
+    run_gemm(handle, options, pruned_a, b, c);
+  }
+  check_cuda(cudaEventRecord(events.stop()), "cudaEventRecord(dense baseline stop)");
+  check_cuda(cudaEventSynchronize(events.stop()), "cudaEventSynchronize(dense baseline stop)");
+
+  float elapsed_ms = 0.0f;
+  check_cuda(cudaEventElapsedTime(&elapsed_ms, events.start(), events.stop()),
+             "cudaEventElapsedTime(dense baseline)");
+  const double dense_ops =
+      2.0 * static_cast<double>(options.m) * static_cast<double>(options.n) *
+      static_cast<double>(options.k) * static_cast<double>(kBaselineIterations);
+  return dense_ops / std::max(static_cast<double>(elapsed_ms) / 1000.0, 1.0e-9) /
+         1.0e12;
+}
+
+Result measure_cusparselt_sparse(
+    cublasHandle_t dense_handle,
+    const Options& options,
+    const __nv_bfloat16* dense_a,
+    const __nv_bfloat16* b,
+    float* c,
+    int requested_sm_count,
+    bool sm_count_target_applied) {
+  SparseCusparseLtState sparse_state =
+      prepare_sparse_cusparselt_state(options, dense_a, b);
+  try {
+    const double dense_baseline_tflops =
+        measure_dense_baseline_tflops(dense_handle, options, sparse_state.pruned_a, b, c);
+
+    std::uint64_t warmup_iterations = 0;
+    run_sparse_active_window(
+        sparse_state, options, b, c, options.warmup_sec, warmup_iterations);
+    check_cuda(cudaStreamSynchronize(sparse_state.stream),
+               "cudaStreamSynchronize(sparse warmup)");
+
+    EventPair events;
+    std::uint64_t iterations = 0;
+    const double period_sec = options.period_ms / 1000.0;
+    const double active_sec = period_sec * options.duty_cycle;
+    const double idle_sec = period_sec - active_sec;
+    auto steady_deadline = std::chrono::steady_clock::now() +
+                           std::chrono::duration<double>(options.steady_sec);
+
+    check_cuda(cudaEventRecord(events.start(), sparse_state.stream),
+               "cudaEventRecord(sparse start)");
+    if (options.duty_cycle == 0.0) {
+      std::this_thread::sleep_for(std::chrono::duration<double>(options.steady_sec));
+    } else {
+      while (std::chrono::steady_clock::now() < steady_deadline) {
+        run_sparse_active_window(sparse_state, options, b, c, active_sec, iterations);
+        check_cuda(cudaStreamSynchronize(sparse_state.stream),
+                   "cudaStreamSynchronize(sparse active)");
+        if (idle_sec > 0.0) {
+          std::this_thread::sleep_for(std::chrono::duration<double>(idle_sec));
+        }
+      }
+    }
+    check_cuda(cudaEventRecord(events.stop(), sparse_state.stream),
+               "cudaEventRecord(sparse stop)");
+    check_cuda(cudaEventSynchronize(events.stop()), "cudaEventSynchronize(sparse stop)");
+
+    float elapsed_ms = 0.0f;
+    check_cuda(cudaEventElapsedTime(&elapsed_ms, events.start(), events.stop()),
+               "cudaEventElapsedTime(sparse)");
+
+    const double dense_equivalent_ops =
+        2.0 * static_cast<double>(options.m) * static_cast<double>(options.n) *
+        static_cast<double>(options.k) * static_cast<double>(iterations);
+    Result result = make_base_result(options, requested_sm_count);
+    result.uses_sparse_tensor_core = (iterations > 0 || warmup_iterations > 0);
+    result.dense_mma_instruction_count_unchanged = false;
+    result.active_elapsed_ms = static_cast<double>(elapsed_ms);
+    result.actual_elapsed_ms = static_cast<double>(elapsed_ms);
+    result.measured_runtime_ms = static_cast<double>(elapsed_ms);
+    result.iterations = iterations;
+    result.active_tflops =
+        dense_equivalent_ops / std::max(static_cast<double>(elapsed_ms) / 1000.0, 1.0e-9) /
+        1.0e12;
+    result.scheduled_tflops = dense_equivalent_ops / options.steady_sec / 1.0e12;
+    result.dense_baseline_tflops = dense_baseline_tflops;
+    result.sparse_tflops_or_dense_equivalent_tflops = result.scheduled_tflops;
+    result.speedup_vs_dense =
+        dense_baseline_tflops > 0.0 ? result.sparse_tflops_or_dense_equivalent_tflops /
+                                          dense_baseline_tflops
+                                    : 0.0;
+    result.duty_control_mode = "cpu_windowed_cusparselt";
+    result.spatial_control_mode = "sparse_cusparselt_full_requested_coverage";
+    result.sm_count_target_applied = sm_count_target_applied;
+    result.compression_time_excluded = true;
+    result.setup_time_excluded = true;
+    result.note =
+        "structured_2to4 uses cuSPARSELt SpMMA with operand A pruned and compressed before the steady sparse window; compression/setup time is excluded from sparse measured_runtime_ms. Dense baseline uses the expanded pruned A values and the same B values. Validate sparse Tensor Core kernels with Nsight Systems/Compute.";
+    destroy_sparse_cusparselt_state(sparse_state);
+    return result;
+  } catch (...) {
+    destroy_sparse_cusparselt_state(sparse_state);
+    throw;
+  }
+}
+#endif
+
 // Accumulator count is compile-time specialized so variants with 1, 2, or 4
 // accumulators do not pay register pressure for unused fragments.
 template <int AccumulatorsPerWarp>
@@ -1023,6 +1406,10 @@ void print_json(const Result& result) {
             << "\"speedup_vs_dense\":" << result.speedup_vs_dense << ","
             << "\"joules_per_dense_equivalent_flop\":"
             << result.joules_per_dense_equivalent_flop << ","
+            << "\"compression_time_excluded\":"
+            << (result.compression_time_excluded ? "true" : "false") << ","
+            << "\"setup_time_excluded\":"
+            << (result.setup_time_excluded ? "true" : "false") << ","
             << "\"note\":\"" << result.note << "\""
             << "}" << std::endl;
 }
@@ -1044,17 +1431,15 @@ int main(int argc, char** argv) {
     const int requested_sm_count = std::max(
         1, static_cast<int>(std::ceil(prop.multiProcessorCount * options.active_sm_fraction)));
 
-    if (options.sparsity_mode == "structured_2to4") {
-      throw std::runtime_error(
-          "sparsity-mode=structured_2to4 requires a real sparse Tensor Core backend "
-          "(cuSPARSELt or CUTLASS SparseGemm) that is not enabled in this build; "
-          "refusing to fall back to dense_zero or dense GEMM");
-    }
-
     if (options.engine == "wmma_persistent" && options.sparsity_mode == "dense_zero") {
       throw std::runtime_error(
           "sparsity-mode=dense_zero is implemented for engine=cublas dense operands; "
           "wmma_persistent uses synthetic WMMA fragments and does not consume initialized A/B operands");
+    }
+    if (options.engine == "wmma_persistent" && options.sparsity_mode == "structured_2to4") {
+      throw std::runtime_error(
+          "sparsity-mode=structured_2to4 is implemented for engine=cublas with a sparse GEMM backend; "
+          "wmma_persistent remains a dense synthetic WMMA engine");
     }
 
     if (options.engine == "wmma_persistent") {
@@ -1102,6 +1487,37 @@ int main(int argc, char** argv) {
         1.0f);
     check_cuda(cudaMemset(c, 0, c_count * sizeof(float)), "cudaMemset(c)");
     check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(init)");
+
+    if (options.sparsity_mode == "structured_2to4") {
+      if (options.sparse_engine == "cutlass_spgemm") {
+        throw std::runtime_error(
+            "sparse-engine=cutlass_spgemm is not enabled in this build; use "
+            "--sparse-engine cusparselt when cuSPARSELt is available");
+      }
+      if (options.sparse_engine != "cusparselt") {
+        throw std::runtime_error("structured_2to4 currently supports --sparse-engine cusparselt");
+      }
+      if (options.sparse_operand != "A") {
+        throw std::runtime_error(
+            "structured_2to4 currently supports operand A first; use --sparse-operand A");
+      }
+#if defined(HAVE_CUSPARSELT)
+      Result result = measure_cusparselt_sparse(
+          handle, options, a, b, c, requested_sm_count, sm_count_target_applied);
+      print_json(result);
+#else
+      throw std::runtime_error(
+          "sparsity-mode=structured_2to4 --sparse-engine cusparselt requires "
+          "cuSPARSELt headers and libcusparseLt at build time; this binary was "
+          "built without HAVE_CUSPARSELT and refuses to fall back to dense_zero "
+          "or dense GEMM");
+#endif
+      cublasDestroy(handle);
+      cudaFree(a);
+      cudaFree(b);
+      cudaFree(c);
+      return 0;
+    }
 
     CorrectnessSmoke correctness_smoke = run_correctness_smoke(handle, options, a, b, c);
     Result result = measure_cublas(

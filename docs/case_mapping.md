@@ -22,7 +22,7 @@ implementations are built and validated on the H100/B200 server.
 | `power_gpu_op_tc_002` | core | Tensor Core GEMM time duty-cycle sweep under `nvidia-smi` locked GPU clocks selected from `auto_low`, `auto_mid`, and `auto_high`. |
 | `power_gpu_op_tc_003` | core | Tensor Core GEMM spatial coverage sweep under `nvidia-smi` locked GPU clocks selected from `auto_low`, `auto_mid`, and `auto_high`. |
 | `power_gpu_op_tc_004` | core | Tensor Core GEMM Power @ Dense-Zero Input Sparsity using the dense Tensor Core path with `--sparsity-mode dense_zero`, zero-ratio sweep, and `uses_sparse_tensor_core=false`. |
-| `power_gpu_op_tc_005` | core | Tensor Core Sparse GEMM Power @ 2:4 Structured Sparsity using `--sparsity-mode structured_2to4` with cuSPARSELt preferred first, then CUTLASS SparseGemm when enabled. This is the true sparse Tensor Core execution case. |
+| `power_gpu_op_tc_005` | core | Tensor Core Sparse GEMM Power @ 2:4 Structured Sparsity using `--sparsity-mode structured_2to4 --sparse-engine cusparselt` when cuSPARSELt is available at build/link time. This is the true sparse Tensor Core execution case; CUTLASS SparseGemm remains future work. |
 | `power_gpu_op_cc_000` | core | CUDA Core floating-point elementwise power versus time duty cycle using `./build/workloads/cuda_core_burn --mode fp32_fma`. |
 | `power_gpu_op_cc_001` | core | CUDA Core integer/logical elementwise power versus time duty cycle using `./build/workloads/cuda_core_burn --mode int32_logic`. |
 | `power_tdp_000` | real_workload | Command-driven real workload TDP test using `workloads/python/real_workload_stub.py --mode tdp_matmul` by default. |
@@ -46,8 +46,9 @@ are related power dimensions, but they are not interchangeable:
 - `power_gpu_op_tc_004` is a dense data-pattern test. It inserts zero values into
   dense operands and still reports `uses_sparse_tensor_core=false`.
 - `power_gpu_op_tc_005` is the true sparse execution test. It requires a valid
-  NVIDIA 2:4 pattern and a backend such as cuSPARSELt or CUTLASS SparseGemm, and
-  must report `uses_sparse_tensor_core=true` when implemented.
+  NVIDIA 2:4 pattern and cuSPARSELt build/link support, and must report
+  `uses_sparse_tensor_core=true` only when `cusparseLtMatmul` executes
+  successfully.
 
 When real implementations are added, run target-server validation with commands
 such as:
