@@ -78,14 +78,31 @@ Current Tensor Core limitations:
   count.
 - `--sparsity-mode dense_zero` inserts zero values into selected dense operands
   and still uses dense Tensor Core instructions. It measures operand zero-value
-  effects, not true sparse Tensor Core execution.
+  effects, not true sparse Tensor Core execution. This maps to
+  `power_gpu_op_tc_004`.
 - `--sparsity-mode structured_2to4` is reserved for real 2:4 sparse Tensor Core
   execution through a backend such as cuSPARSELt or CUTLASS SparseGemm. If the
   backend is not available, the workload fails clearly rather than falling back
-  to dense execution.
+  to dense execution. This maps to `power_gpu_op_tc_005`.
+- `power_gpu_op_tc_001` remains the active SM spatial coverage test. It varies
+  `--active-sm-fraction`; it must not be implemented by inserting zeros into
+  input matrices.
+- Summary JSON separates these dimensions with `spatial_coverage_fraction`,
+  `sparsity_test_dimension`, `tensor_core_execution_path`,
+  `uses_sparse_tensor_core`, and `dense_mma_instruction_count_unchanged`.
+
+The dimensions are related but not interchangeable:
+
+- Active SM coverage measures how power changes as more SMs or CTAs are
+  simultaneously active while each active SM remains Tensor Core saturated.
+- Dense-zero input sparsity measures operand zero-value/data-pattern effects
+  under unchanged dense MMA instruction execution.
+- 2:4 structured sparsity measures true sparse Tensor Core execution with a
+  valid NVIDIA 2:4 sparse pattern and a sparse GEMM backend.
 
 ```bash
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --warmup-sec 30 --steady-sec 60
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 0.5 --warmup-sec 30 --steady-sec 60
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --sparsity-mode dense_zero --zero-ratio 0.5 --zero-pattern regular_k --sparse-operand A --warmup-sec 5 --steady-sec 10
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --sparsity-mode structured_2to4 --sparse-engine cusparselt --warmup-sec 5 --steady-sec 10
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wmma_persistent --m 8192 --n 8192 --k 8192 --duty-cycle 0.5 --active-sm-fraction 1.0 --period-ms 10 --warmup-sec 5 --steady-sec 10

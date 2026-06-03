@@ -69,6 +69,9 @@ struct Result {
   int occupancy_max_active_blocks_per_sm = 0;
   int effective_blocks_per_sm_estimate = 0;
   bool occupancy_limited = false;
+  double spatial_coverage_fraction = 0.0;
+  std::string sparsity_test_dimension = "none";
+  std::string tensor_core_execution_path = "dense_tensor_core";
   std::string sparsity_mode = "none";
   double zero_ratio = 0.0;
   std::string zero_pattern = "regular_k";
@@ -118,8 +121,15 @@ Result make_base_result(const Options& options, int requested_sm_count) {
   result.sparse_engine =
       options.sparsity_mode == "structured_2to4" ? options.sparse_engine : "";
   result.sparse_pattern = options.sparsity_mode == "structured_2to4" ? "2:4" : "";
-  result.uses_sparse_tensor_core = false;
+  result.uses_sparse_tensor_core = options.sparsity_mode == "structured_2to4";
   result.dense_mma_instruction_count_unchanged = options.sparsity_mode != "structured_2to4";
+  result.spatial_coverage_fraction = options.active_sm_fraction;
+  if (options.sparsity_mode == "dense_zero") {
+    result.sparsity_test_dimension = "dense_zero_input_data_pattern";
+  } else if (options.sparsity_mode == "structured_2to4") {
+    result.sparsity_test_dimension = "structured_2to4_sparse_tensor_core";
+    result.tensor_core_execution_path = "sparse_tensor_core";
+  }
   result.logical_m = options.m;
   result.logical_n = options.n;
   result.logical_k = options.k;
@@ -983,6 +993,10 @@ void print_json(const Result& result) {
             << result.effective_blocks_per_sm_estimate << ","
             << "\"occupancy_limited\":"
             << (result.occupancy_limited ? "true" : "false") << ","
+            << "\"spatial_coverage_fraction\":" << result.spatial_coverage_fraction << ","
+            << "\"sparsity_test_dimension\":\"" << result.sparsity_test_dimension << "\","
+            << "\"tensor_core_execution_path\":\"" << result.tensor_core_execution_path
+            << "\","
             << "\"sparsity_mode\":\"" << result.sparsity_mode << "\","
             << "\"zero_ratio\":" << result.zero_ratio << ","
             << "\"zero_pattern\":\"" << result.zero_pattern << "\","

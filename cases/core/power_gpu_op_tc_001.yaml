@@ -1,7 +1,7 @@
 case_id: power_gpu_op_tc_001
 feature_name: AI Core / Tensor Core
-case_name: Tensor Core GEMM power versus active SM coverage
-title: Tensor Core GEMM power versus active SM coverage
+case_name: Tensor Core GEMM Power @ SM Spatial Coverage
+title: Tensor Core GEMM Power @ SM Spatial Coverage
 category: core
 platform:
   targets: [NVIDIA H100, NVIDIA B200]
@@ -62,11 +62,14 @@ clock_control:
   sm_clock_mhz: null
   mem_clock_mhz: null
 expected:
-  summary: Sweep Tensor Core spatial coverage from 10% to 100%.
-  key_metrics: [avg_power_watts_by_coverage, active_sm_coverage_pct]
+  summary: Sweep Tensor Core SM spatial coverage from 10% to 100% without changing operand sparsity.
+  key_metrics: [avg_power_watts_by_spatial_coverage, active_sm_coverage_pct, tensor_core_utilization_pct]
   pass_criteria:
     - Coverage points are reflected in workload metadata.
-    - Power trend and saturation point are reported.
+    - Power trend and spatial saturation point are reported.
+    - Input matrices remain dense; this case is not implemented by inserting zeros.
 notes:
   - Initial spatial coverage uses cuBLAS SM-count targeting where supported by the target CUDA toolkit.
+  - This case controls active SM/CTA coverage and is separate from dense-zero or 2:4 sparse input tests.
+  - Each active SM should remain Tensor Core saturated; validate with Nsight profiler metrics on H100/B200.
   - CUTLASS integration is optional and reserved for a later step.

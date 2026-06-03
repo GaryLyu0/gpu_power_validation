@@ -232,15 +232,43 @@ active/idle switching cadence; `--blocks-per-sm`, `--mma-iters-per-loop`, and
 validate actual SM activity and Tensor Core utilization with Nsight profiler
 metrics on the H100 server.
 
-Sparsity is a separate test axis from active-SM coverage. Dense-zero sparsity
-uses dense Tensor Core instructions with zero-filled operands:
+Tensor Core power has separate test dimensions that should not be mixed:
+
+- `power_gpu_op_tc_001` is active SM spatial coverage. It changes
+  `--active-sm-fraction` and should keep each active SM Tensor Core saturated.
+- `power_gpu_op_tc_004` is dense-zero input sparsity. It inserts zero values into
+  dense operands and still uses dense Tensor Core instructions.
+- `power_gpu_op_tc_005` is true 2:4 structured sparsity. It requires a sparse
+  Tensor Core backend such as cuSPARSELt or CUTLASS SparseGemm.
+
+Dense baseline:
+
+```bash
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --warmup-sec 30 --steady-sec 60
+```
+
+Active SM spatial coverage example:
+
+```bash
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 0.5 --warmup-sec 30 --steady-sec 60
+```
+
+Dense-zero data-pattern example. Summary JSON reports
+`uses_sparse_tensor_core=false` and
+`dense_mma_instruction_count_unchanged=true`:
 
 ```bash
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --sparsity-mode dense_zero --zero-ratio 0.5 --zero-pattern regular_k --sparse-operand A --warmup-sec 5 --steady-sec 10
 ```
 
-True 2:4 structured sparsity requires a real sparse backend such as cuSPARSELt;
-the workload fails clearly if that backend is not enabled.
+True 2:4 structured sparse example. Summary JSON for an implemented backend
+must report `uses_sparse_tensor_core=true`, `sparse_pattern="2:4"`, and the
+selected `sparse_engine`. The current scaffold fails clearly if the backend is
+not enabled:
+
+```bash
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --sparsity-mode structured_2to4 --sparse-engine cusparselt --warmup-sec 5 --steady-sec 10
+```
 
 `nvbandwidth` can be built separately from `third_party/nvbandwidth` and used as
 a cross-check, but the primary IO cases do not depend on it and this framework
@@ -299,6 +327,8 @@ python -m runner.run_case --case cases/io/PWR-MEM-002.yaml
 python -m runner.run_case --case cases/mem/PWR-MEM-003.yaml
 python -m runner.run_case --case cases/core/power_gpu_op_tc_000.yaml
 python -m runner.run_case --case cases/core/power_gpu_op_tc_001.yaml
+python -m runner.run_case --case cases/core/power_gpu_op_tc_004.yaml
+python -m runner.run_case --case cases/core/power_gpu_op_tc_005.yaml --dry-run
 python -m runner.run_case --case cases/core/power_gpu_op_cc_000.yaml
 python -m runner.run_case --case cases/core/power_gpu_op_cc_001.yaml
 ```

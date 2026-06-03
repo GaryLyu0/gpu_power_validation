@@ -1,0 +1,90 @@
+case_id: power_gpu_op_tc_004
+feature_name: AI Core / Tensor Core
+case_name: Tensor Core GEMM Power @ Dense-Zero Input Sparsity
+title: Tensor Core GEMM Power @ Dense-Zero Input Sparsity
+category: core
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Tensor Core GEMM workload is built on the target H100/B200 server.
+  - Dense-zero mode uses the dense cuBLAS Tensor Core path and does not require cuSPARSELt.
+  - Active SM spatial coverage is held constant so this case measures operand data-pattern effects.
+workload:
+  type: command
+  executable: ./build/workloads/tensor_core_burn
+  args:
+    - --device
+    - "0"
+    - --dtype
+    - bf16
+    - --engine
+    - cublas
+    - --m
+    - "8192"
+    - --n
+    - "8192"
+    - --k
+    - "8192"
+    - --duty-cycle
+    - "1.0"
+    - --active-sm-fraction
+    - "1.0"
+    - --sparsity-mode
+    - dense_zero
+    - --zero-ratio
+    - "{zero_ratio}"
+    - --zero-pattern
+    - regular_k
+    - --sparse-operand
+    - "{sparse_operand}"
+    - --warmup-sec
+    - "30"
+    - --steady-sec
+    - "60"
+parameters:
+  warmup_sec: 30
+  steady_sec: 60
+  sweep:
+    zero_ratio:
+      - {label: "0pct", value: "0.0"}
+      - {label: "25pct", value: "0.25"}
+      - {label: "50pct", value: "0.5"}
+      - {label: "75pct", value: "0.75"}
+      - {label: "875pct", value: "0.875"}
+    sparse_operand:
+      - {label: "operand_A", value: A}
+      - {label: "operand_B", value: B}
+      - {label: "both_operands", value: both}
+    zero_pattern: regular_k
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_gpu_pct
+    - sm_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Sweep dense-zero operand ratios while using unchanged dense Tensor Core MMA execution.
+  key_metrics:
+    - avg_power_watts_by_zero_ratio
+    - zero_ratio
+    - sparse_operand
+    - uses_sparse_tensor_core
+    - dense_mma_instruction_count_unchanged
+  pass_criteria:
+    - Summary JSON reports uses_sparse_tensor_core=false.
+    - Summary JSON reports dense_mma_instruction_count_unchanged=true.
+    - Correctness smoke check passes against the actual zero-filled dense operands.
+    - Active SM coverage remains fixed at 100%; this is not a spatial coverage sweep.
+notes:
+  - Dense-zero mode measures operand zero-value/data-pattern effects under dense Tensor Core execution.
+  - This case must not be described as true sparse Tensor Core execution.
+  - Use power_gpu_op_tc_001 for active SM spatial coverage and power_gpu_op_tc_005 for true 2:4 sparse execution.

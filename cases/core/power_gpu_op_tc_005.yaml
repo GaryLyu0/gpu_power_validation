@@ -1,0 +1,88 @@
+case_id: power_gpu_op_tc_005
+feature_name: AI Core / Tensor Core
+case_name: Tensor Core Sparse GEMM Power @ 2:4 Structured Sparsity
+title: Tensor Core Sparse GEMM Power @ 2:4 Structured Sparsity
+category: core
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [0]
+preconditions:
+  - Tensor Core sparse GEMM backend is built on the target H100/B200 server.
+  - Preferred backend order is cuSPARSELt first, then CUTLASS SparseGemm if enabled.
+  - Sparse operand uses a valid NVIDIA 2:4 structured sparsity pattern along K.
+  - Compression and pruning are prepared outside the steady-state power window unless explicitly enabled later.
+workload:
+  type: command
+  executable: ./build/workloads/tensor_core_burn
+  args:
+    - --device
+    - "0"
+    - --dtype
+    - bf16
+    - --engine
+    - cublas
+    - --m
+    - "8192"
+    - --n
+    - "8192"
+    - --k
+    - "8192"
+    - --duty-cycle
+    - "1.0"
+    - --active-sm-fraction
+    - "1.0"
+    - --sparsity-mode
+    - structured_2to4
+    - --sparse-engine
+    - "{sparse_engine}"
+    - --sparse-operand
+    - A
+    - --warmup-sec
+    - "30"
+    - --steady-sec
+    - "60"
+parameters:
+  warmup_sec: 30
+  steady_sec: 60
+  sweep:
+    sparse_engine:
+      - {label: "cusparselt", value: cusparselt}
+      - {label: "cutlass_spgemm", value: cutlass_spgemm}
+    sparse_pattern: "2:4"
+    dense_baseline: same_logical_shape_and_expanded_sparse_operand_values
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_gpu_pct
+    - sm_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Run true 2:4 structured sparse Tensor Core GEMM when a backend is available.
+  key_metrics:
+    - avg_power_watts
+    - p95_power_watts
+    - max_power_watts
+    - uses_sparse_tensor_core
+    - sparse_pattern
+    - sparse_engine
+    - dense_baseline_tflops
+    - sparse_tflops_or_dense_equivalent_tflops
+    - speedup_vs_dense
+    - joules_per_dense_equivalent_flop
+  pass_criteria:
+    - Summary JSON reports uses_sparse_tensor_core=true for implemented sparse backends.
+    - Summary JSON reports sparse_pattern="2:4" and the selected sparse_engine.
+    - Dense baseline uses the same logical M/N/K shape and expanded sparse operand values.
+    - If no backend is available, the workload fails clearly instead of silently falling back to dense_zero.
+notes:
+  - This case is reserved for true hardware sparse Tensor Core execution.
+  - Current workload scaffolding accepts the structured_2to4 CLI and fails clearly until cuSPARSELt or CUTLASS SparseGemm integration is enabled on H100/B200.
+  - Use power_gpu_op_tc_004 for dense-zero data-pattern testing under dense Tensor Core execution.
