@@ -17,6 +17,8 @@ workload:
     - "0"
     - --dtype
     - bf16
+    - --engine
+    - wmma_persistent
     - --m
     - "8192"
     - --n
@@ -27,6 +29,18 @@ workload:
     - "{duty_cycle}"
     - --active-sm-fraction
     - "1.0"
+    - --period-ms
+    - "500"
+    - --blocks-per-sm
+    - "6"
+    - --mma-iters-per-loop
+    - "256"
+    - --accumulators-per-warp
+    - "2"
+    - --atomic-period
+    - "8192"
+    - --sparsity-mode
+    - none
     - --warmup-sec
     - "30"
     - --steady-sec
@@ -69,5 +83,7 @@ expected:
     - Each clock point completes all duty-cycle steps on the target server.
     - Clock lock state is recorded with telemetry.
 notes:
+  - This is the locked-frequency version of power_gpu_op_tc_000.
+  - Uses wmma_persistent for fine-grained time-utilization control inside the CUDA kernel with clock64.
   - Do not emulate clock behavior on laptops.
   - Dry-run prints planned clock changes; non-dry-run resolves auto clocks through nvidia-smi on the target server.

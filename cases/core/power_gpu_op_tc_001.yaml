@@ -17,6 +17,8 @@ workload:
     - "0"
     - --dtype
     - bf16
+    - --engine
+    - cublas
     - --m
     - "8192"
     - --n
@@ -27,6 +29,10 @@ workload:
     - "1.0"
     - --active-sm-fraction
     - "{active_sm_fraction}"
+    - --period-ms
+    - "1000"
+    - --sparsity-mode
+    - none
     - --warmup-sec
     - "30"
     - --steady-sec
@@ -69,7 +75,8 @@ expected:
     - Power trend and spatial saturation point are reported.
     - Input matrices remain dense; this case is not implemented by inserting zeros.
 notes:
-  - Initial spatial coverage uses cuBLAS SM-count targeting where supported by the target CUDA toolkit.
+  - active_sm_fraction is implemented through cuBLAS SM-count targeting where supported by the target CUDA toolkit.
   - This case controls active SM/CTA coverage and is separate from dense-zero or 2:4 sparse input tests.
-  - Each active SM should remain Tensor Core saturated; validate with Nsight profiler metrics on H100/B200.
+  - Actual SM activity should be validated with Nsight/DCGM metrics on H100/B200.
+  - wmma_persistent parameters are not used by this case.
   - CUTLASS integration is optional and reserved for a later step.

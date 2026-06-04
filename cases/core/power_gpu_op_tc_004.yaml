@@ -30,6 +30,8 @@ workload:
     - "1.0"
     - --active-sm-fraction
     - "1.0"
+    - --period-ms
+    - "1000"
     - --sparsity-mode
     - dense_zero
     - --zero-ratio
@@ -86,5 +88,6 @@ expected:
     - Active SM coverage remains fixed at 100%; this is not a spatial coverage sweep.
 notes:
   - Dense-zero mode measures operand zero-value/data-pattern effects under dense Tensor Core execution.
+  - dense_zero does not use hardware Sparse Tensor Cores and does not use wmma_persistent synthetic fragments.
   - This case must not be described as true sparse Tensor Core execution.
   - Use power_gpu_op_tc_001 for active SM spatial coverage and power_gpu_op_tc_005 for true 2:4 sparse execution.

@@ -17,6 +17,8 @@ workload:
     - "0"
     - --dtype
     - bf16
+    - --engine
+    - wmma_persistent
     - --m
     - "8192"
     - --n
@@ -27,6 +29,18 @@ workload:
     - "{duty_cycle}"
     - --active-sm-fraction
     - "1.0"
+    - --period-ms
+    - "500"
+    - --blocks-per-sm
+    - "6"
+    - --mma-iters-per-loop
+    - "256"
+    - --accumulators-per-warp
+    - "2"
+    - --atomic-period
+    - "8192"
+    - --sparsity-mode
+    - none
     - --warmup-sec
     - "30"
     - --steady-sec
@@ -69,6 +83,7 @@ expected:
     - Power increases with higher duty cycle unless capped by clocks or thermals.
     - All duty-cycle points produce complete telemetry.
 notes:
-  - Uses cuBLAS BF16 GEMM as the initial Tensor Core burn path.
-  - CUTLASS integration is optional and reserved for a later step.
+  - Uses wmma_persistent for fine-grained time-utilization control inside the CUDA kernel with clock64.
+  - active_sm_fraction is fixed at 100%; spatial coverage is covered by power_gpu_op_tc_001.
+  - Sparse and dense-zero modes are not part of this duty-cycle case.
   - Dry-run records command generation only.

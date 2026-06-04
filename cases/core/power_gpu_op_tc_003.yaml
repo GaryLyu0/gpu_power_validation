@@ -17,6 +17,8 @@ workload:
     - "0"
     - --dtype
     - bf16
+    - --engine
+    - cublas
     - --m
     - "8192"
     - --n
@@ -27,6 +29,10 @@ workload:
     - "1.0"
     - --active-sm-fraction
     - "{active_sm_fraction}"
+    - --period-ms
+    - "1000"
+    - --sparsity-mode
+    - none
     - --warmup-sec
     - "30"
     - --steady-sec
@@ -68,5 +74,8 @@ expected:
     - All clock and coverage combinations are represented.
     - Summary reports coverage-dependent saturation at each clock.
 notes:
+  - This is the locked-frequency version of power_gpu_op_tc_001.
+  - active_sm_fraction is implemented through cuBLAS SM-count targeting where supported by the target CUDA toolkit.
+  - wmma_persistent parameters are not used by this case.
   - Runtime clock checks must be implemented on the H100/B200 server path.
   - Dry-run prints planned clock changes; non-dry-run resolves auto clocks through nvidia-smi on the target server.

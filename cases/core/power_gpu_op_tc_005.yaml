@@ -31,6 +31,8 @@ workload:
     - "1.0"
     - --active-sm-fraction
     - "1.0"
+    - --period-ms
+    - "1000"
     - --sparsity-mode
     - structured_2to4
     - --sparse-engine
@@ -86,6 +88,7 @@ expected:
     - If cuSPARSELt is unavailable, the workload fails clearly instead of silently falling back to dense_zero.
 notes:
   - This case is reserved for true hardware sparse Tensor Core execution.
+  - This case uses cuSPARSELt; wmma_persistent parameters do not apply.
   - The cusparselt backend prunes/checks operand A, compresses it, and repeatedly calls cusparseLtMatmul during the steady window.
   - If tensor_core_burn is built without cuSPARSELt support, this case fails clearly instead of falling back to dense execution.
   - CUTLASS SparseGemm is a future backend and is intentionally not included in the normal sweep yet.
