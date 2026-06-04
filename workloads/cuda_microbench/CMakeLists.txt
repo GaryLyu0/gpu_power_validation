@@ -47,26 +47,49 @@ target_link_libraries(sm_issue_coverage PRIVATE CUDA::cudart)
 target_link_libraries(tma_copy PRIVATE CUDA::cudart)
 target_link_libraries(tensor_core_burn PRIVATE CUDA::cublas)
 
-find_path(
-  CUSPARSELT_INCLUDE_DIR
-  NAMES cusparseLt.h
-  HINTS ENV CUSPARSELT_ROOT
-  PATH_SUFFIXES include
-)
-find_library(
-  CUSPARSELT_LIBRARY
-  NAMES cusparseLt
-  HINTS ENV CUSPARSELT_ROOT
-  PATH_SUFFIXES lib lib64
-)
+set(CUSPARSELT_ROOT "" CACHE PATH "Optional cuSPARSELt installation prefix")
+
+set(_CUSPARSELT_PREFIX_HINTS)
+if(CUSPARSELT_ROOT)
+  list(APPEND _CUSPARSELT_PREFIX_HINTS "${CUSPARSELT_ROOT}")
+endif()
+if(DEFINED ENV{CUSPARSELT_ROOT} AND NOT "$ENV{CUSPARSELT_ROOT}" STREQUAL "")
+  list(APPEND _CUSPARSELT_PREFIX_HINTS "$ENV{CUSPARSELT_ROOT}")
+endif()
+
+set(_CUSPARSELT_INCLUDE_HINTS)
+set(_CUSPARSELT_LIBRARY_HINTS)
+foreach(prefix IN LISTS _CUSPARSELT_PREFIX_HINTS)
+  list(APPEND _CUSPARSELT_INCLUDE_HINTS "${prefix}/include")
+  list(APPEND _CUSPARSELT_LIBRARY_HINTS "${prefix}/lib" "${prefix}/lib64" "${prefix}/lib/x64")
+endforeach()
+if(CUDAToolkit_TARGET_DIR)
+  list(APPEND _CUSPARSELT_INCLUDE_HINTS "${CUDAToolkit_TARGET_DIR}/include")
+  list(APPEND _CUSPARSELT_LIBRARY_HINTS
+    "${CUDAToolkit_TARGET_DIR}/lib"
+    "${CUDAToolkit_TARGET_DIR}/lib64"
+    "${CUDAToolkit_TARGET_DIR}/lib/x64"
+  )
+endif()
+if(CUDAToolkit_INCLUDE_DIRS)
+  list(APPEND _CUSPARSELT_INCLUDE_HINTS ${CUDAToolkit_INCLUDE_DIRS})
+endif()
+if(CUDAToolkit_LIBRARY_DIR)
+  list(APPEND _CUSPARSELT_LIBRARY_HINTS "${CUDAToolkit_LIBRARY_DIR}")
+endif()
+
+find_path(CUSPARSELT_INCLUDE_DIR NAMES cusparseLt.h HINTS ${_CUSPARSELT_INCLUDE_HINTS})
+find_library(CUSPARSELT_LIBRARY NAMES cusparseLt HINTS ${_CUSPARSELT_LIBRARY_HINTS})
 
 if(CUSPARSELT_INCLUDE_DIR AND CUSPARSELT_LIBRARY)
   target_include_directories(tensor_core_burn PRIVATE "${CUSPARSELT_INCLUDE_DIR}")
   target_link_libraries(tensor_core_burn PRIVATE "${CUSPARSELT_LIBRARY}")
   target_compile_definitions(tensor_core_burn PRIVATE HAVE_CUSPARSELT=1)
-  message(STATUS "cuSPARSELt enabled for tensor_core_burn: ${CUSPARSELT_LIBRARY}")
+  message(STATUS "cuSPARSELt support: ON")
+  message(STATUS "cuSPARSELt include: ${CUSPARSELT_INCLUDE_DIR}")
+  message(STATUS "cuSPARSELt library: ${CUSPARSELT_LIBRARY}")
 else()
-  message(STATUS "cuSPARSELt not found; structured_2to4 mode will fail clearly at runtime")
+  message(STATUS "cuSPARSELt support: OFF")
 endif()
 
 if(GPU_POWER_ENABLE_EXPERIMENTAL_TMA)
