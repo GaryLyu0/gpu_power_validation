@@ -112,7 +112,9 @@ For `structured_2to4 --sparse-engine cusparselt`, setup creates dense A/B
 buffers, prunes/checks A into a valid 2:4 pattern with cuSPARSELt, compresses A,
 measures a short dense cuBLAS baseline using the expanded pruned A and same B,
 then repeatedly calls `cusparseLtMatmul` during the sparse steady window.
-Prune/compression/setup time is excluded from `measured_runtime_ms`.
+The sparse cuSPARSELt path uses BF16 A/B and BF16 C/D with FP32 compute; the
+dense baseline keeps BF16 input and FP32 output. Prune/compression/setup time is
+excluded from `measured_runtime_ms`.
 
 ```bash
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --warmup-sec 30 --steady-sec 60

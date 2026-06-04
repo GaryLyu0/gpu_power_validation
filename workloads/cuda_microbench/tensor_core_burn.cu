@@ -164,7 +164,9 @@ void check_cublas(cublasStatus_t status, const char* call) {
 void check_cusparselt(cusparseStatus_t status, const char* call) {
   if (status != CUSPARSE_STATUS_SUCCESS) {
     std::ostringstream message;
-    message << call << " failed with cusparseStatus_t=" << static_cast<int>(status);
+    message << call << " failed with cusparseStatus_t=" << static_cast<int>(status)
+            << " (" << cusparseLtGetErrorName(status) << ": "
+            << cusparseLtGetErrorString(status) << ")";
     throw std::runtime_error(message.str());
   }
 }
@@ -690,6 +692,7 @@ struct SparseCusparseLtState {
   void* compressed_a = nullptr;
   void* compressed_buffer = nullptr;
   __nv_bfloat16* pruned_a = nullptr;
+  __nv_bfloat16* sparse_c = nullptr;
   int* d_valid = nullptr;
   std::size_t workspace_size = 0;
   std::size_t compressed_size = 0;
@@ -708,6 +711,7 @@ void destroy_sparse_cusparselt_state(SparseCusparseLtState& state) {
   cudaFree(state.compressed_a);
   cudaFree(state.compressed_buffer);
   cudaFree(state.pruned_a);
+  cudaFree(state.sparse_c);
   cudaFree(state.d_valid);
   if (state.stream_initialized) {
     cudaStreamDestroy(state.stream);
@@ -739,6 +743,11 @@ SparseCusparseLtState prepare_sparse_cusparselt_state(
   (void)dense_b;
   SparseCusparseLtState state;
   try {
+    if (options.m % 16 != 0 || options.n % 16 != 0 || options.k % 16 != 0) {
+      throw std::runtime_error(
+          "structured_2to4 BF16 cuSPARSELt path requires m, n, and k to be multiples of 16");
+    }
+
     check_cuda(cudaStreamCreate(&state.stream), "cudaStreamCreate(cusparselt)");
     state.stream_initialized = true;
     check_cusparselt(cusparseLtInit(&state.handle), "cusparseLtInit");
@@ -778,7 +787,7 @@ SparseCusparseLtState prepare_sparse_cusparselt_state(
             options.n,
             options.m,
             kAlignment,
-            CUDA_R_32F,
+            CUDA_R_16BF,
             CUSPARSE_ORDER_COL),
         "cusparseLtDenseDescriptorInit(C)");
     state.mat_c_initialized = true;
@@ -790,7 +799,7 @@ SparseCusparseLtState prepare_sparse_cusparselt_state(
             options.n,
             options.m,
             kAlignment,
-            CUDA_R_32F,
+            CUDA_R_16BF,
             CUSPARSE_ORDER_COL),
         "cusparseLtDenseDescriptorInit(D)");
     state.mat_d_initialized = true;
@@ -842,6 +851,16 @@ SparseCusparseLtState prepare_sparse_cusparselt_state(
     check_cuda(
         cudaMalloc(reinterpret_cast<void**>(&state.pruned_a), a_count * sizeof(__nv_bfloat16)),
         "cudaMalloc(pruned_a)");
+    const std::size_t c_count = static_cast<std::size_t>(options.m) * options.n;
+    check_cuda(
+        cudaMalloc(reinterpret_cast<void**>(&state.sparse_c), c_count * sizeof(__nv_bfloat16)),
+        "cudaMalloc(sparse_c)");
+    check_cuda(cudaMemsetAsync(
+                   state.sparse_c,
+                   0,
+                   c_count * sizeof(__nv_bfloat16),
+                   state.stream),
+               "cudaMemsetAsync(sparse_c)");
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&state.d_valid), sizeof(int)),
                "cudaMalloc(d_valid)");
 
@@ -890,8 +909,7 @@ SparseCusparseLtState prepare_sparse_cusparselt_state(
 
 void run_sparse_cusparselt_gemm(
     SparseCusparseLtState& state,
-    const __nv_bfloat16* b,
-    float* c) {
+    const __nv_bfloat16* b) {
   const float alpha = 1.0f;
   const float beta = 0.0f;
   cudaStream_t streams[] = {state.stream};
@@ -903,8 +921,8 @@ void run_sparse_cusparselt_gemm(
           state.compressed_a,
           b,
           &beta,
-          c,
-          c,
+          state.sparse_c,
+          state.sparse_c,
           state.workspace,
           streams,
           1),
@@ -915,7 +933,6 @@ void run_sparse_active_window(
     SparseCusparseLtState& state,
     const Options& options,
     const __nv_bfloat16* b,
-    float* c,
     double seconds,
     std::uint64_t& iterations) {
   if (seconds <= 0.0) {
@@ -924,7 +941,7 @@ void run_sparse_active_window(
   auto deadline = std::chrono::steady_clock::now() +
                   std::chrono::duration<double>(seconds);
   while (std::chrono::steady_clock::now() < deadline) {
-    run_sparse_cusparselt_gemm(state, b, c);
+    run_sparse_cusparselt_gemm(state, b);
     ++iterations;
   }
 }
@@ -973,7 +990,7 @@ Result measure_cusparselt_sparse(
 
     std::uint64_t warmup_iterations = 0;
     run_sparse_active_window(
-        sparse_state, options, b, c, options.warmup_sec, warmup_iterations);
+        sparse_state, options, b, options.warmup_sec, warmup_iterations);
     check_cuda(cudaStreamSynchronize(sparse_state.stream),
                "cudaStreamSynchronize(sparse warmup)");
 
@@ -991,7 +1008,7 @@ Result measure_cusparselt_sparse(
       std::this_thread::sleep_for(std::chrono::duration<double>(options.steady_sec));
     } else {
       while (std::chrono::steady_clock::now() < steady_deadline) {
-        run_sparse_active_window(sparse_state, options, b, c, active_sec, iterations);
+        run_sparse_active_window(sparse_state, options, b, active_sec, iterations);
         check_cuda(cudaStreamSynchronize(sparse_state.stream),
                    "cudaStreamSynchronize(sparse active)");
         if (idle_sec > 0.0) {
