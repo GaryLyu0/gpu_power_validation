@@ -121,6 +121,16 @@ struct Result {
   int synthetic_n_tiles = 0;
   int synthetic_k_tiles = 0;
   std::uint64_t synthetic_mma_ops_per_loop = 0;
+  std::uint64_t requested_synthetic_tile_ops = 0;
+  std::uint64_t distributed_synthetic_ops_per_block = 0;
+  std::uint64_t synthetic_mma_ops_cap = 0;
+  bool synthetic_mma_ops_cap_applied = false;
+  int cutlass_atom_shape_m = 0;
+  int cutlass_atom_shape_n = 0;
+  int cutlass_atom_shape_k = 0;
+  std::string cutlass_atom_arch = "";
+  bool uses_cutlass_tiled_mma_object = false;
+  bool uses_cutlass_mma_atom_direct = false;
   std::uint64_t initial_global_load_bytes = 0;
   std::uint64_t steady_global_load_bytes_per_loop = 0;
   std::uint64_t final_global_store_bytes = 0;
@@ -312,9 +322,12 @@ Options parse_args(int argc, char** argv) {
           << "For wmma_persistent, --period-ms controls switching cadence while "
           << "--blocks-per-sm, --mma-iters-per-loop, and "
           << "--accumulators-per-warp control active intensity.\n"
-          << "engine=cutlass_tile_burn is experimental: it uses CUTLASS/CuTe "
-          << "middle-level MMA components for a synthetic persistent tile burn, "
-          << "not a full GEMM shape benchmark.\n"
+          << "engine=cutlass_tile_burn is experimental: it is a CUTLASS/CuTe "
+          << "MMA atom based synthetic Tensor Core burn. It does not use "
+          << "top-level CUTLASS device::Gemm, does not load real A/B matrices, "
+          << "does not use shared-memory A/B tiles, and cutlass-tile-m/n/k "
+          << "define synthetic atom grouping rather than real tile-local GEMM "
+          << "storage.\n"
           << "sparsity-mode=dense_zero inserts zero values into dense cuBLAS operands "
           << "but does not use hardware sparse Tensor Cores.\n"
           << "sparsity-mode=structured_2to4 requires a real sparse backend such as "
@@ -1580,10 +1593,13 @@ Result measure_cutlass_tile_burn(
   const bool occupancy_limited = blocks_per_sm > occupancy_max_active_blocks_per_sm;
   const std::uint64_t distributed_ops =
       std::max<std::uint64_t>(1, (synthetic_tile_ops + grid_blocks - 1) / grid_blocks);
+  const std::uint64_t synthetic_mma_ops_cap =
+      static_cast<std::uint64_t>(options.mma_iters_per_loop);
+  const bool synthetic_mma_ops_cap_applied = distributed_ops > synthetic_mma_ops_cap;
   const int synthetic_mma_ops_per_loop =
       static_cast<int>(std::min<std::uint64_t>(
           std::max<std::uint64_t>(1, distributed_ops),
-          static_cast<std::uint64_t>(options.mma_iters_per_loop)));
+          synthetic_mma_ops_cap));
 
   constexpr int kWarpsPerBlock = 4;
   constexpr int kValuesPerWarp = 4;
@@ -1673,11 +1689,33 @@ Result measure_cutlass_tile_burn(
     result.synthetic_n_tiles = synthetic_n_tiles;
     result.synthetic_k_tiles = synthetic_k_tiles;
     result.synthetic_mma_ops_per_loop = synthetic_mma_ops_per_loop;
+    result.requested_synthetic_tile_ops = synthetic_tile_ops;
+    result.distributed_synthetic_ops_per_block = distributed_ops;
+    result.synthetic_mma_ops_cap = synthetic_mma_ops_cap;
+    result.synthetic_mma_ops_cap_applied = synthetic_mma_ops_cap_applied;
+    result.cutlass_atom_shape_m = kAtomM;
+    result.cutlass_atom_shape_n = kAtomN;
+    result.cutlass_atom_shape_k = kAtomK;
+    result.cutlass_atom_arch = "SM80";
+    result.uses_cutlass_tiled_mma_object = true;
+    result.uses_cutlass_mma_atom_direct = true;
     result.initial_global_load_bytes = 0;
     result.steady_global_load_bytes_per_loop = 0;
     result.final_global_store_bytes = output_values * sizeof(float);
-    result.note =
-        "cutlass_tile_burn is an experimental synthetic Tensor Core burn. It uses a CUTLASS/CuTe SM80 BF16 MMA atom in a persistent clock64-controlled kernel, initializes tile-local register operands once per CTA, reuses them during active phases, and does not run a real full GEMM shape benchmark. synthetic_m/n/k and cutlass_tile_m/n/k define the reported synthetic tile count; mma_iters_per_loop caps the per-loop atom issue count.";
+    std::ostringstream note;
+    note
+        << "cutlass_tile_burn is an experimental CUTLASS/CuTe MMA atom based synthetic Tensor Core burn. It uses a CUTLASS/CuTe SM80 BF16 MMA atom directly in a persistent clock64-controlled kernel, does not use top-level CUTLASS device::Gemm, does not load real A/B matrices, does not use shared-memory A/B tiles, and does not run a real full GEMM shape benchmark. cutlass_tile_m/n/k define synthetic atom grouping, not real tile-local GEMM storage. Current version is register-constant atom burn; a later implementation may add a true tile-local shared-memory CUTLASS/CuTe burn that loads A/B tiles once per CTA and reuses them.";
+    if (synthetic_mma_ops_cap_applied) {
+      note << " synthetic_mma_ops_cap_applied=true because the requested synthetic M/N/K maps to "
+           << distributed_ops << " atom operations per block per loop, exceeding the cap of "
+           << synthetic_mma_ops_cap
+           << ". Raise --mma-iters-per-loop if you want the synthetic M/N/K to issue more atoms per loop.";
+    } else {
+      note << " synthetic_mma_ops_cap_applied=false because the requested synthetic M/N/K maps to "
+           << distributed_ops << " atom operations per block per loop within the cap of "
+           << synthetic_mma_ops_cap << ".";
+    }
+    result.note = note.str();
     return result;
   } catch (...) {
     cudaFree(output);
@@ -1779,6 +1817,21 @@ void print_json(const Result& result) {
             << "\"synthetic_n_tiles\":" << result.synthetic_n_tiles << ","
             << "\"synthetic_k_tiles\":" << result.synthetic_k_tiles << ","
             << "\"synthetic_mma_ops_per_loop\":" << result.synthetic_mma_ops_per_loop << ","
+            << "\"requested_synthetic_tile_ops\":"
+            << result.requested_synthetic_tile_ops << ","
+            << "\"distributed_synthetic_ops_per_block\":"
+            << result.distributed_synthetic_ops_per_block << ","
+            << "\"synthetic_mma_ops_cap\":" << result.synthetic_mma_ops_cap << ","
+            << "\"synthetic_mma_ops_cap_applied\":"
+            << (result.synthetic_mma_ops_cap_applied ? "true" : "false") << ","
+            << "\"cutlass_atom_shape_m\":" << result.cutlass_atom_shape_m << ","
+            << "\"cutlass_atom_shape_n\":" << result.cutlass_atom_shape_n << ","
+            << "\"cutlass_atom_shape_k\":" << result.cutlass_atom_shape_k << ","
+            << "\"cutlass_atom_arch\":\"" << result.cutlass_atom_arch << "\","
+            << "\"uses_cutlass_tiled_mma_object\":"
+            << (result.uses_cutlass_tiled_mma_object ? "true" : "false") << ","
+            << "\"uses_cutlass_mma_atom_direct\":"
+            << (result.uses_cutlass_mma_atom_direct ? "true" : "false") << ","
             << "\"initial_global_load_bytes\":" << result.initial_global_load_bytes << ","
             << "\"steady_global_load_bytes_per_loop\":"
             << result.steady_global_load_bytes_per_loop << ","

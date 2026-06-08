@@ -253,16 +253,25 @@ Active SM spatial coverage example:
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 0.5 --warmup-sec 30 --steady-sec 60
 ```
 
-Experimental CUTLASS/CuTe tile burn prototype:
+Experimental CUTLASS/CuTe MMA atom burn prototype:
 
 ```bash
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cutlass_tile_burn --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 2 --mma-iters-per-loop 256 --cutlass-tile-m 64 --cutlass-tile-n 64 --cutlass-tile-k 32 --sparsity-mode none --warmup-sec 5 --steady-sec 10
 ```
 
-`cutlass_tile_burn` is for synthetic Tensor Core burn only. It uses CUTLASS/CuTe
-middle-level MMA components and reports `matrix_shape_is_real=false`; existing
-YAML cases should stay on the validated engines until this prototype is
-profiled on H100/B200.
+`cutlass_tile_burn` is for synthetic Tensor Core burn only. It calls a
+CUTLASS/CuTe SM80 BF16 MMA atom directly, does not use top-level
+`cutlass::gemm::device::Gemm`, does not load real A/B matrices, and does not use
+shared-memory A/B tiles. `cutlass_tile_m/n/k` define synthetic atom grouping, not
+real tile-local GEMM storage. Existing YAML cases should stay on the validated
+engines until this prototype is profiled on H100/B200.
+
+Cap reporting examples:
+
+```bash
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cutlass_tile_burn --m 16 --n 8 --k 16 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 1 --mma-iters-per-loop 256 --cutlass-tile-m 16 --cutlass-tile-n 8 --cutlass-tile-k 16 --sparsity-mode none --warmup-sec 1 --steady-sec 2
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cutlass_tile_burn --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 2 --mma-iters-per-loop 256 --cutlass-tile-m 64 --cutlass-tile-n 64 --cutlass-tile-k 32 --sparsity-mode none --warmup-sec 5 --steady-sec 10
+```
 
 Dense-zero data-pattern example. Summary JSON reports
 `uses_sparse_tensor_core=false` and
