@@ -253,6 +253,17 @@ Active SM spatial coverage example:
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cublas --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 0.5 --warmup-sec 30 --steady-sec 60
 ```
 
+Experimental CUTLASS/CuTe tile burn prototype:
+
+```bash
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cutlass_tile_burn --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 2 --mma-iters-per-loop 256 --cutlass-tile-m 64 --cutlass-tile-n 64 --cutlass-tile-k 32 --sparsity-mode none --warmup-sec 5 --steady-sec 10
+```
+
+`cutlass_tile_burn` is for synthetic Tensor Core burn only. It uses CUTLASS/CuTe
+middle-level MMA components and reports `matrix_shape_is_real=false`; existing
+YAML cases should stay on the validated engines until this prototype is
+profiled on H100/B200.
+
 Dense-zero data-pattern example. Summary JSON reports
 `uses_sparse_tensor_core=false` and
 `dense_mma_instruction_count_unchanged=true`:

@@ -2,6 +2,11 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
+#if defined(HAVE_CUTLASS_CUTE)
+#include <cute/arch/mma_sm80.hpp>
+#include <cute/atom/mma_atom.hpp>
+#include <cute/tensor.hpp>
+#endif
 #if defined(HAVE_CUSPARSELT)
 #include <cusparseLt.h>
 #endif
@@ -38,6 +43,12 @@ struct Options {
   int mma_iters_per_loop = 64;
   int accumulators_per_warp = 1;
   int atomic_period = 1024;
+  int cutlass_tile_m = 16;
+  int cutlass_tile_n = 8;
+  int cutlass_tile_k = 16;
+  int synthetic_m = 0;
+  int synthetic_n = 0;
+  int synthetic_k = 0;
   std::string sparsity_mode = "none";
   double zero_ratio = 0.0;
   std::string zero_pattern = "regular_k";
@@ -98,6 +109,21 @@ struct Result {
   double joules_per_dense_equivalent_flop = 0.0;
   bool compression_time_excluded = false;
   bool setup_time_excluded = false;
+  bool matrix_shape_is_real = true;
+  bool synthetic_mnk_controls_mma_count = false;
+  bool memory_traffic_minimized = false;
+  std::string uses_global_ab = "";
+  bool uses_shared_memory_tiles = false;
+  int cutlass_tile_m = 0;
+  int cutlass_tile_n = 0;
+  int cutlass_tile_k = 0;
+  int synthetic_m_tiles = 0;
+  int synthetic_n_tiles = 0;
+  int synthetic_k_tiles = 0;
+  std::uint64_t synthetic_mma_ops_per_loop = 0;
+  std::uint64_t initial_global_load_bytes = 0;
+  std::uint64_t steady_global_load_bytes_per_loop = 0;
+  std::uint64_t final_global_store_bytes = 0;
   std::string note;
 };
 
@@ -199,6 +225,10 @@ int parse_device(const std::string& value) {
   return static_cast<int>(parsed);
 }
 
+int ceil_div_int(int value, int divisor) {
+  return (value + divisor - 1) / divisor;
+}
+
 Options parse_args(int argc, char** argv) {
   Options options;
   for (int index = 1; index < argc; ++index) {
@@ -240,6 +270,18 @@ Options parse_args(int argc, char** argv) {
       options.accumulators_per_warp = parse_int(require_value(arg), arg);
     } else if (arg == "--atomic-period") {
       options.atomic_period = parse_int(require_value(arg), arg);
+    } else if (arg == "--cutlass-tile-m") {
+      options.cutlass_tile_m = parse_int(require_value(arg), arg);
+    } else if (arg == "--cutlass-tile-n") {
+      options.cutlass_tile_n = parse_int(require_value(arg), arg);
+    } else if (arg == "--cutlass-tile-k") {
+      options.cutlass_tile_k = parse_int(require_value(arg), arg);
+    } else if (arg == "--synthetic-m") {
+      options.synthetic_m = parse_int(require_value(arg), arg);
+    } else if (arg == "--synthetic-n") {
+      options.synthetic_n = parse_int(require_value(arg), arg);
+    } else if (arg == "--synthetic-k") {
+      options.synthetic_k = parse_int(require_value(arg), arg);
     } else if (arg == "--sparsity-mode") {
       options.sparsity_mode = require_value(arg);
     } else if (arg == "--zero-ratio") {
@@ -253,11 +295,13 @@ Options parse_args(int argc, char** argv) {
     } else if (arg == "--help") {
       std::cout
           << "Usage: tensor_core_burn --device 0 --dtype bf16 "
-          << "--engine cublas|wmma_persistent --m 8192 --n 8192 "
+          << "--engine cublas|wmma_persistent|cutlass_tile_burn --m 8192 --n 8192 "
           << "--k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 "
           << "--period-ms 1000 --blocks-per-sm 1 "
           << "--mma-iters-per-loop 64 --accumulators-per-warp 1 "
           << "--atomic-period 1024 "
+          << "--cutlass-tile-m 16 --cutlass-tile-n 8 --cutlass-tile-k 16 "
+          << "--synthetic-m 8192 --synthetic-n 8192 --synthetic-k 8192 "
           << "--sparsity-mode none|dense_zero|structured_2to4 "
           << "--zero-ratio 0.0 --zero-pattern regular_k "
           << "--sparse-operand A --sparse-engine cusparselt "
@@ -268,6 +312,9 @@ Options parse_args(int argc, char** argv) {
           << "For wmma_persistent, --period-ms controls switching cadence while "
           << "--blocks-per-sm, --mma-iters-per-loop, and "
           << "--accumulators-per-warp control active intensity.\n"
+          << "engine=cutlass_tile_burn is experimental: it uses CUTLASS/CuTe "
+          << "middle-level MMA components for a synthetic persistent tile burn, "
+          << "not a full GEMM shape benchmark.\n"
           << "sparsity-mode=dense_zero inserts zero values into dense cuBLAS operands "
           << "but does not use hardware sparse Tensor Cores.\n"
           << "sparsity-mode=structured_2to4 requires a real sparse backend such as "
@@ -281,8 +328,9 @@ Options parse_args(int argc, char** argv) {
   if (options.dtype != "bf16") {
     throw std::runtime_error("Only --dtype bf16 is supported in this workload");
   }
-  if (options.engine != "cublas" && options.engine != "wmma_persistent") {
-    throw std::runtime_error("--engine must be cublas or wmma_persistent");
+  if (options.engine != "cublas" && options.engine != "wmma_persistent" &&
+      options.engine != "cutlass_tile_burn") {
+    throw std::runtime_error("--engine must be cublas, wmma_persistent, or cutlass_tile_burn");
   }
   if (options.duty_cycle < 0.0 || options.duty_cycle > 1.0) {
     throw std::runtime_error("--duty-cycle must be in [0, 1]");
@@ -308,6 +356,10 @@ Options parse_args(int argc, char** argv) {
   }
   if (options.atomic_period <= 0) {
     throw std::runtime_error("--atomic-period must be > 0");
+  }
+  if (options.cutlass_tile_m <= 0 || options.cutlass_tile_n <= 0 ||
+      options.cutlass_tile_k <= 0) {
+    throw std::runtime_error("--cutlass-tile-m/n/k must be > 0");
   }
   if (options.sparsity_mode != "none" && options.sparsity_mode != "dense_zero" &&
       options.sparsity_mode != "structured_2to4") {
@@ -1360,6 +1412,290 @@ Result measure_wmma_persistent(
   }
 }
 
+#if defined(HAVE_CUTLASS_CUTE)
+__global__ void cutlass_tile_burn_kernel(
+    float* output,
+    unsigned long long* iterations,
+    unsigned long long duration_cycles,
+    unsigned long long period_cycles,
+    unsigned long long active_cycles,
+    int synthetic_mma_ops_per_loop,
+    int atomic_period) {
+  constexpr int kWarpsPerBlock = 4;
+  constexpr std::uint32_t kBf16OnePair = 0x3f803f80U;
+
+  // The prototype identifies the middle-level CuTe TiledMMA/atom shape here,
+  // then calls the SM80 BF16 atom directly in the tight loop to avoid global
+  // A/B traffic and top-level device::Gemm scheduling.
+  using CuteMmaAtom = cute::SM80_16x8x16_F32BF16BF16F32_TN;
+  [[maybe_unused]] auto tiled_mma = cute::make_tiled_mma(CuteMmaAtom{});
+
+  const unsigned long long start = clock64();
+  const int lane_id = threadIdx.x % 32;
+  const int warp_id = threadIdx.x / 32;
+  float c0 = 0.0f;
+  float c1 = 0.0f;
+  float c2 = 0.0f;
+  float c3 = 0.0f;
+  unsigned long long pending_iterations = 0;
+
+  while (true) {
+    unsigned long long elapsed = clock64() - start;
+    if (elapsed >= duration_cycles) {
+      break;
+    }
+
+    const bool active =
+        active_cycles > 0 &&
+        (active_cycles >= period_cycles || (elapsed % period_cycles) < active_cycles);
+    if (active) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      for (int op = 0; op < synthetic_mma_ops_per_loop; ++op) {
+        CuteMmaAtom::fma(
+            c0,
+            c1,
+            c2,
+            c3,
+            kBf16OnePair,
+            kBf16OnePair,
+            kBf16OnePair,
+            kBf16OnePair,
+            kBf16OnePair,
+            kBf16OnePair,
+            c0,
+            c1,
+            c2,
+            c3);
+      }
+#endif
+      if (lane_id == 0) {
+        pending_iterations += static_cast<unsigned long long>(synthetic_mma_ops_per_loop);
+        if (pending_iterations >= static_cast<unsigned long long>(atomic_period)) {
+          atomicAdd(iterations, pending_iterations);
+          pending_iterations = 0;
+        }
+      }
+    } else {
+      __nanosleep(1000);
+    }
+  }
+
+  if (lane_id == 0) {
+    if (pending_iterations > 0) {
+      atomicAdd(iterations, pending_iterations);
+    }
+    std::size_t base =
+        (static_cast<std::size_t>(blockIdx.x) * kWarpsPerBlock + warp_id) * 4;
+    output[base + 0] = c0;
+    output[base + 1] = c1;
+    output[base + 2] = c2;
+    output[base + 3] = c3;
+  }
+}
+
+int query_cutlass_tile_burn_occupancy() {
+  int blocks_per_sm = 0;
+  check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                 &blocks_per_sm, cutlass_tile_burn_kernel, kWmmaThreadsPerBlock, 0),
+             "cudaOccupancyMaxActiveBlocksPerMultiprocessor(cutlass_tile_burn)");
+  return blocks_per_sm;
+}
+
+void launch_cutlass_tile_burn_window(
+    const Options& options,
+    int clock_rate_khz,
+    float* output,
+    unsigned long long* iteration_counter,
+    int grid_blocks,
+    int synthetic_mma_ops_per_loop,
+    double seconds,
+    bool reset_counter) {
+  if (reset_counter) {
+    check_cuda(cudaMemset(iteration_counter, 0, sizeof(unsigned long long)),
+               "cudaMemset(cutlass iteration_counter)");
+  }
+  if (seconds <= 0.0) {
+    return;
+  }
+  unsigned long long duration_cycles =
+      static_cast<unsigned long long>(seconds * static_cast<double>(clock_rate_khz) * 1000.0);
+  unsigned long long period_cycles =
+      static_cast<unsigned long long>((options.period_ms / 1000.0) *
+                                      static_cast<double>(clock_rate_khz) * 1000.0);
+  period_cycles = std::max<unsigned long long>(period_cycles, 1);
+  unsigned long long active_cycles =
+      static_cast<unsigned long long>(static_cast<double>(period_cycles) * options.duty_cycle);
+
+  cutlass_tile_burn_kernel<<<grid_blocks, kWmmaThreadsPerBlock>>>(
+      output,
+      iteration_counter,
+      duration_cycles,
+      period_cycles,
+      active_cycles,
+      synthetic_mma_ops_per_loop,
+      options.atomic_period);
+  check_cuda(cudaGetLastError(), "cutlass_tile_burn_kernel");
+}
+
+Result measure_cutlass_tile_burn(
+    const Options& options,
+    const cudaDeviceProp& prop,
+    int requested_sm_count) {
+  if (prop.major < 8) {
+    throw std::runtime_error("engine=cutlass_tile_burn requires SM80 or newer");
+  }
+  if (options.sparsity_mode != "none") {
+    throw std::runtime_error("engine=cutlass_tile_burn supports --sparsity-mode none only");
+  }
+  constexpr int kAtomM = 16;
+  constexpr int kAtomN = 8;
+  constexpr int kAtomK = 16;
+  if (options.cutlass_tile_m % kAtomM != 0 || options.cutlass_tile_n % kAtomN != 0 ||
+      options.cutlass_tile_k % kAtomK != 0) {
+    throw std::runtime_error(
+        "cutlass_tile_burn prototype requires tile M/N/K to be multiples of 16/8/16");
+  }
+
+  const int synthetic_m = options.synthetic_m > 0 ? options.synthetic_m : options.m;
+  const int synthetic_n = options.synthetic_n > 0 ? options.synthetic_n : options.n;
+  const int synthetic_k = options.synthetic_k > 0 ? options.synthetic_k : options.k;
+  const int synthetic_m_tiles = ceil_div_int(synthetic_m, options.cutlass_tile_m);
+  const int synthetic_n_tiles = ceil_div_int(synthetic_n, options.cutlass_tile_n);
+  const int synthetic_k_tiles = ceil_div_int(synthetic_k, options.cutlass_tile_k);
+  const std::uint64_t atom_ops_per_cutlass_tile =
+      static_cast<std::uint64_t>(options.cutlass_tile_m / kAtomM) *
+      static_cast<std::uint64_t>(options.cutlass_tile_n / kAtomN) *
+      static_cast<std::uint64_t>(options.cutlass_tile_k / kAtomK);
+  const std::uint64_t synthetic_tile_ops =
+      static_cast<std::uint64_t>(synthetic_m_tiles) *
+      static_cast<std::uint64_t>(synthetic_n_tiles) *
+      static_cast<std::uint64_t>(synthetic_k_tiles) * atom_ops_per_cutlass_tile;
+
+  const int clock_rate_khz = get_device_clock_rate_khz(options.device);
+  const int blocks_per_sm = options.blocks_per_sm;
+  const int grid_blocks = requested_sm_count * blocks_per_sm;
+  const int occupancy_max_active_blocks_per_sm = query_cutlass_tile_burn_occupancy();
+  const int effective_blocks_per_sm_estimate =
+      std::min(blocks_per_sm, occupancy_max_active_blocks_per_sm);
+  const bool occupancy_limited = blocks_per_sm > occupancy_max_active_blocks_per_sm;
+  const std::uint64_t distributed_ops =
+      std::max<std::uint64_t>(1, (synthetic_tile_ops + grid_blocks - 1) / grid_blocks);
+  const int synthetic_mma_ops_per_loop =
+      static_cast<int>(std::min<std::uint64_t>(
+          std::max<std::uint64_t>(1, distributed_ops),
+          static_cast<std::uint64_t>(options.mma_iters_per_loop)));
+
+  constexpr int kWarpsPerBlock = 4;
+  constexpr int kValuesPerWarp = 4;
+  float* output = nullptr;
+  unsigned long long* iteration_counter = nullptr;
+  unsigned long long host_iterations = 0;
+  const std::size_t output_values =
+      static_cast<std::size_t>(grid_blocks) * kWarpsPerBlock * kValuesPerWarp;
+  check_cuda(cudaMalloc(reinterpret_cast<void**>(&output), output_values * sizeof(float)),
+             "cudaMalloc(cutlass output)");
+  check_cuda(cudaMalloc(reinterpret_cast<void**>(&iteration_counter),
+                        sizeof(unsigned long long)),
+             "cudaMalloc(cutlass iteration_counter)");
+
+  try {
+    launch_cutlass_tile_burn_window(
+        options,
+        clock_rate_khz,
+        output,
+        iteration_counter,
+        grid_blocks,
+        synthetic_mma_ops_per_loop,
+        options.warmup_sec,
+        true);
+    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(cutlass warmup)");
+
+    EventPair events;
+    check_cuda(cudaEventRecord(events.start()), "cudaEventRecord(cutlass start)");
+    launch_cutlass_tile_burn_window(
+        options,
+        clock_rate_khz,
+        output,
+        iteration_counter,
+        grid_blocks,
+        synthetic_mma_ops_per_loop,
+        options.steady_sec,
+        true);
+    check_cuda(cudaEventRecord(events.stop()), "cudaEventRecord(cutlass stop)");
+    check_cuda(cudaEventSynchronize(events.stop()), "cudaEventSynchronize(cutlass stop)");
+
+    float elapsed_ms = 0.0f;
+    check_cuda(cudaEventElapsedTime(&elapsed_ms, events.start(), events.stop()),
+               "cudaEventElapsedTime(cutlass)");
+    check_cuda(cudaMemcpy(&host_iterations,
+                          iteration_counter,
+                          sizeof(host_iterations),
+                          cudaMemcpyDeviceToHost),
+               "cudaMemcpy(cutlass iteration_counter)");
+
+    const double ops_per_atom = 2.0 * static_cast<double>(kAtomM) *
+                                static_cast<double>(kAtomN) *
+                                static_cast<double>(kAtomK);
+    const double total_ops = ops_per_atom * static_cast<double>(host_iterations);
+    const double active_elapsed_ms =
+        std::max(static_cast<double>(elapsed_ms) * options.duty_cycle, 0.0);
+    const double active_elapsed_s = std::max(active_elapsed_ms / 1000.0, 1.0e-9);
+
+    cudaFree(output);
+    cudaFree(iteration_counter);
+
+    Result result = make_base_result(options, requested_sm_count);
+    result.active_elapsed_ms = active_elapsed_ms;
+    result.iterations = host_iterations;
+    result.active_tflops = total_ops / active_elapsed_s / 1.0e12;
+    result.scheduled_tflops = total_ops / options.steady_sec / 1.0e12;
+    result.actual_elapsed_ms = static_cast<double>(elapsed_ms);
+    result.measured_runtime_ms = static_cast<double>(elapsed_ms);
+    result.sparse_tflops_or_dense_equivalent_tflops = result.scheduled_tflops;
+    result.duty_control_mode = "device_clock64_persistent_cutlass_tile_kernel";
+    result.spatial_control_mode = "persistent_cta_count";
+    result.grid_blocks = grid_blocks;
+    result.blocks_per_sm = blocks_per_sm;
+    result.mma_iters_per_loop = options.mma_iters_per_loop;
+    result.atomic_period = options.atomic_period;
+    result.occupancy_max_active_blocks_per_sm = occupancy_max_active_blocks_per_sm;
+    result.effective_blocks_per_sm_estimate = effective_blocks_per_sm_estimate;
+    result.occupancy_limited = occupancy_limited;
+    result.matrix_shape_is_real = false;
+    result.synthetic_mnk_controls_mma_count = true;
+    result.memory_traffic_minimized = true;
+    result.uses_global_ab = "false";
+    result.uses_shared_memory_tiles = false;
+    result.cutlass_tile_m = options.cutlass_tile_m;
+    result.cutlass_tile_n = options.cutlass_tile_n;
+    result.cutlass_tile_k = options.cutlass_tile_k;
+    result.synthetic_m_tiles = synthetic_m_tiles;
+    result.synthetic_n_tiles = synthetic_n_tiles;
+    result.synthetic_k_tiles = synthetic_k_tiles;
+    result.synthetic_mma_ops_per_loop = synthetic_mma_ops_per_loop;
+    result.initial_global_load_bytes = 0;
+    result.steady_global_load_bytes_per_loop = 0;
+    result.final_global_store_bytes = output_values * sizeof(float);
+    result.note =
+        "cutlass_tile_burn is an experimental synthetic Tensor Core burn. It uses a CUTLASS/CuTe SM80 BF16 MMA atom in a persistent clock64-controlled kernel, initializes tile-local register operands once per CTA, reuses them during active phases, and does not run a real full GEMM shape benchmark. synthetic_m/n/k and cutlass_tile_m/n/k define the reported synthetic tile count; mma_iters_per_loop caps the per-loop atom issue count.";
+    return result;
+  } catch (...) {
+    cudaFree(output);
+    cudaFree(iteration_counter);
+    throw;
+  }
+}
+#else
+Result measure_cutlass_tile_burn(
+    const Options&,
+    const cudaDeviceProp&,
+    int) {
+  throw std::runtime_error(
+      "engine=cutlass_tile_burn requires CUTLASS/CuTe headers from third_party/cutlass "
+      "and a build with HAVE_CUTLASS_CUTE");
+}
+#endif
+
 void print_json(const Result& result) {
   std::cout << "{"
             << "\"workload\":\"tensor_core_burn\","
@@ -1427,6 +1763,26 @@ void print_json(const Result& result) {
             << (result.compression_time_excluded ? "true" : "false") << ","
             << "\"setup_time_excluded\":"
             << (result.setup_time_excluded ? "true" : "false") << ","
+            << "\"matrix_shape_is_real\":"
+            << (result.matrix_shape_is_real ? "true" : "false") << ","
+            << "\"synthetic_mnk_controls_mma_count\":"
+            << (result.synthetic_mnk_controls_mma_count ? "true" : "false") << ","
+            << "\"memory_traffic_minimized\":"
+            << (result.memory_traffic_minimized ? "true" : "false") << ","
+            << "\"uses_global_ab\":\"" << result.uses_global_ab << "\","
+            << "\"uses_shared_memory_tiles\":"
+            << (result.uses_shared_memory_tiles ? "true" : "false") << ","
+            << "\"cutlass_tile_m\":" << result.cutlass_tile_m << ","
+            << "\"cutlass_tile_n\":" << result.cutlass_tile_n << ","
+            << "\"cutlass_tile_k\":" << result.cutlass_tile_k << ","
+            << "\"synthetic_m_tiles\":" << result.synthetic_m_tiles << ","
+            << "\"synthetic_n_tiles\":" << result.synthetic_n_tiles << ","
+            << "\"synthetic_k_tiles\":" << result.synthetic_k_tiles << ","
+            << "\"synthetic_mma_ops_per_loop\":" << result.synthetic_mma_ops_per_loop << ","
+            << "\"initial_global_load_bytes\":" << result.initial_global_load_bytes << ","
+            << "\"steady_global_load_bytes_per_loop\":"
+            << result.steady_global_load_bytes_per_loop << ","
+            << "\"final_global_store_bytes\":" << result.final_global_store_bytes << ","
             << "\"note\":\"" << result.note << "\""
             << "}" << std::endl;
 }
@@ -1458,9 +1814,18 @@ int main(int argc, char** argv) {
           "sparsity-mode=structured_2to4 is implemented for engine=cublas with a sparse GEMM backend; "
           "wmma_persistent remains a dense synthetic WMMA engine");
     }
+    if (options.engine == "cutlass_tile_burn" && options.sparsity_mode != "none") {
+      throw std::runtime_error(
+          "engine=cutlass_tile_burn is a dense synthetic tile burn and supports --sparsity-mode none only");
+    }
 
     if (options.engine == "wmma_persistent") {
       Result result = measure_wmma_persistent(options, prop, requested_sm_count);
+      print_json(result);
+      return 0;
+    }
+    if (options.engine == "cutlass_tile_burn") {
+      Result result = measure_cutlass_tile_burn(options, prop, requested_sm_count);
       print_json(result);
       return 0;
     }

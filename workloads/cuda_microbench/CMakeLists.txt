@@ -47,6 +47,15 @@ target_link_libraries(sm_issue_coverage PRIVATE CUDA::cudart)
 target_link_libraries(tma_copy PRIVATE CUDA::cudart)
 target_link_libraries(tensor_core_burn PRIVATE CUDA::cublas)
 
+set(CUTLASS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/cutlass/include")
+if(EXISTS "${CUTLASS_INCLUDE_DIR}/cute/tensor.hpp")
+  target_include_directories(tensor_core_burn PRIVATE "${CUTLASS_INCLUDE_DIR}")
+  target_compile_definitions(tensor_core_burn PRIVATE HAVE_CUTLASS_CUTE=1)
+  message(STATUS "CUTLASS/CuTe tile burn support: ON")
+else()
+  message(STATUS "CUTLASS/CuTe tile burn support: OFF")
+endif()
+
 set(CUSPARSELT_ROOT "" CACHE PATH "Optional cuSPARSELt installation prefix")
 
 set(_CUSPARSELT_PREFIX_HINTS)

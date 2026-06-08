@@ -61,6 +61,11 @@ changes the active memory range.
 - `--engine wmma_persistent` launches persistent CTAs and uses device-side
   `clock64` control so short active/idle periods do not depend on CPU-side GEMM
   launch timing.
+- `--engine cutlass_tile_burn` is an experimental CUTLASS/CuTe tile-level burn.
+  It uses middle-level CuTe MMA atoms in a persistent kernel, initializes
+  tile-local operands once, and reuses them during active phases. It does not use
+  top-level `cutlass::gemm::device::Gemm` and is not a real full GEMM
+  matrix-shape benchmark.
 
 CUTLASS integration remains optional for a later step and is not required by
 these cases.
@@ -78,6 +83,13 @@ Current Tensor Core limitations:
   `--mma-iters-per-loop`, `--accumulators-per-warp`, `--atomic-period`,
   `--active-sm-fraction`, `--duty-cycle`, and `--period-ms`. `--period-ms`
   controls active/idle switching cadence, not active compute intensity.
+- For `cutlass_tile_burn`, `m`, `n`, and `k` are synthetic logical dimensions
+  unless `--synthetic-m`, `--synthetic-n`, and `--synthetic-k` are provided.
+  They control reported synthetic tile counts, not real matrix coverage.
+  `--cutlass-tile-m`, `--cutlass-tile-n`, and `--cutlass-tile-k` describe the
+  synthetic tile shape; the prototype currently emits SM80 BF16 MMA atoms and
+  reports `matrix_shape_is_real=false`, `memory_traffic_minimized=true`, and
+  `uses_global_ab=false`.
 - Validate actual spatial coverage and Tensor Core utilization with Nsight
   profiler metrics on the H100 server for both engines.
 - `wmma_persistent` reports `occupancy_max_active_blocks_per_sm`,
@@ -125,6 +137,7 @@ excluded from `measured_runtime_ms`.
 ./build/workloads/tensor_core_burn --device 4 --dtype bf16 --engine wmma_persistent --m 16384 --n 16384 --k 16384 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 2 --mma-iters-per-loop 256 --warmup-sec 5 --steady-sec 10
 ./build/workloads/tensor_core_burn --device 4 --dtype bf16 --engine wmma_persistent --m 16384 --n 16384 --k 16384 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 3 --mma-iters-per-loop 256 --accumulators-per-warp 4 --atomic-period 8192 --warmup-sec 5 --steady-sec 20
 ./build/workloads/tensor_core_burn --device 4 --dtype bf16 --engine wmma_persistent --m 16384 --n 16384 --k 16384 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 6 --mma-iters-per-loop 256 --accumulators-per-warp 2 --atomic-period 8192 --warmup-sec 5 --steady-sec 20
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cutlass_tile_burn --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 2 --mma-iters-per-loop 256 --cutlass-tile-m 64 --cutlass-tile-n 64 --cutlass-tile-k 32 --sparsity-mode none --warmup-sec 5 --steady-sec 10
 ```
 
 ## cuda_core_burn
