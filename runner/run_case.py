@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from runner.case_schema import CaseValidationError, load_case
@@ -174,6 +175,20 @@ def _run_sweep_workloads(
                     + "\n"
                 )
                 stdout.flush()
+                start_timestamp_ns = time.time_ns()
+                stdout.write(
+                    json.dumps(
+                        {
+                            "phase": "runner_sweep_point_start",
+                            "label": sweep.label,
+                            "point": sweep.point,
+                            "timestamp_ns": start_timestamp_ns,
+                        }
+                    )
+                    + "\n"
+                )
+                stdout.flush()
+                return_code = -1
                 try:
                     completed = subprocess.run(
                         sweep.workload.command,
@@ -184,13 +199,29 @@ def _run_sweep_workloads(
                         timeout=sweep.workload.timeout_s,
                         check=False,
                     )
-                    return_codes.append(completed.returncode)
+                    return_code = completed.returncode
+                    return_codes.append(return_code)
                 except subprocess.TimeoutExpired:
                     stderr.write(
                         f"Workload {sweep.label} timed out after "
                         f"{sweep.workload.timeout_s} seconds\n"
                     )
-                    return_codes.append(-1)
+                    return_codes.append(return_code)
+                finally:
+                    end_timestamp_ns = time.time_ns()
+                    stdout.write(
+                        json.dumps(
+                            {
+                                "phase": "runner_sweep_point_end",
+                                "label": sweep.label,
+                                "point": sweep.point,
+                                "timestamp_ns": end_timestamp_ns,
+                                "return_code": return_code,
+                            }
+                        )
+                        + "\n"
+                    )
+                    stdout.flush()
             return 0 if all(code == 0 for code in return_codes) else 1
 
 

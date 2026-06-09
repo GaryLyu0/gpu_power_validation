@@ -51,8 +51,18 @@ def test_mock_workload_with_mock_telemetry_runs_without_gpu(tmp_path: Path) -> N
     )
 
     summary = json.loads(result_dir.joinpath("summary.json").read_text(encoding="utf-8"))
+    stdout_records = [
+        json.loads(line)
+        for line in result_dir.joinpath("stdout.log").read_text(encoding="utf-8").splitlines()
+        if line.startswith("{")
+    ]
     assert summary["status"] == "passed"
     assert summary["return_code"] == 0
     assert summary["telemetry"]["sampler"] == "mock_nvml"
     assert summary["telemetry"]["power"]["avg_w"] is not None
     assert summary["workload_command"][1:3] == ["-m", "workloads.python.sleep"]
+    assert any(record["phase"] == "runner_sweep_point_start" for record in stdout_records)
+    assert any(record["phase"] == "runner_sweep_point_end" for record in stdout_records)
+    assert len(summary["sweep_power_stats"]) == 1
+    assert summary["sweep_power_stats"][0]["label"] == "single"
+    assert summary["sweep_power_stats"][0]["power"]["avg_w"] is not None

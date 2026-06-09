@@ -44,6 +44,7 @@ def write_summary(
 ) -> Path:
     power_stats = compute_power_stats(samples or [])
     workload_results = parse_workload_results(result_dir / "stdout.log")
+    sweep_power_stats = compute_sweep_power_stats(case, samples or [], workload_results)
     summary: dict[str, Any] = {
         "case": case_to_dict(case),
         "status": status,
@@ -55,6 +56,7 @@ def write_summary(
         "workload_results": workload_results,
         "workload_summary": _last_steady_result(workload_results),
         "sweep_plan": sweep_plan or [],
+        "sweep_power_stats": sweep_power_stats,
         "telemetry": {
             "sampler": telemetry_sampler or case.telemetry.sampler,
             "interval_ms": case.telemetry.interval_ms,
@@ -73,6 +75,67 @@ def write_summary(
     summary_path = result_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary_path
+
+
+def compute_sweep_power_stats(
+    case: CaseSpec,
+    samples: list[TelemetrySample],
+    workload_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    pending_starts: list[dict[str, Any]] = []
+    sweep_stats: list[dict[str, Any]] = []
+    warmup_sec = _warmup_seconds(case)
+
+    for result in workload_results:
+        phase = result.get("phase")
+        if phase == "runner_sweep_point_start":
+            pending_starts.append(result)
+            continue
+        if phase != "runner_sweep_point_end":
+            continue
+
+        start = _pop_matching_start(pending_starts, result)
+        if start is None:
+            continue
+
+        start_timestamp_ns = _optional_int(start.get("timestamp_ns"))
+        end_timestamp_ns = _optional_int(result.get("timestamp_ns"))
+        if start_timestamp_ns is None or end_timestamp_ns is None:
+            continue
+
+        steady_window_fallback_used = warmup_sec is None
+        if warmup_sec is None:
+            steady_start_timestamp_ns = start_timestamp_ns
+        else:
+            steady_start_timestamp_ns = start_timestamp_ns + int(warmup_sec * 1_000_000_000)
+        steady_end_timestamp_ns = end_timestamp_ns
+
+        selected_samples = _filter_samples(
+            samples,
+            steady_start_timestamp_ns,
+            steady_end_timestamp_ns,
+        )
+        if not selected_samples:
+            selected_samples = _filter_samples(samples, start_timestamp_ns, end_timestamp_ns)
+            steady_start_timestamp_ns = start_timestamp_ns
+            steady_end_timestamp_ns = end_timestamp_ns
+            steady_window_fallback_used = True
+
+        sweep_stats.append(
+            {
+                "label": result.get("label", start.get("label", "")),
+                "point": result.get("point", start.get("point", {})),
+                "start_timestamp_ns": start_timestamp_ns,
+                "end_timestamp_ns": end_timestamp_ns,
+                "steady_start_timestamp_ns": steady_start_timestamp_ns,
+                "steady_end_timestamp_ns": steady_end_timestamp_ns,
+                "steady_window_fallback_used": steady_window_fallback_used,
+                "sample_count": len(selected_samples),
+                "power": compute_power_stats(selected_samples),
+            }
+        )
+
+    return sweep_stats
 
 
 def compute_power_stats(samples: list[TelemetrySample]) -> dict[str, float | None]:
@@ -98,6 +161,41 @@ def _percentile(sorted_values: list[float], percentile: int) -> float:
     upper = min(lower + 1, len(sorted_values) - 1)
     weight = rank - lower
     return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def _warmup_seconds(case: CaseSpec) -> float | None:
+    value = case.parameters.get("warmup_sec")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
+
+
+def _optional_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _pop_matching_start(
+    pending_starts: list[dict[str, Any]],
+    end_marker: dict[str, Any],
+) -> dict[str, Any] | None:
+    end_label = end_marker.get("label")
+    end_point = end_marker.get("point")
+    for index, start in enumerate(pending_starts):
+        if start.get("label") == end_label and start.get("point") == end_point:
+            return pending_starts.pop(index)
+    return pending_starts.pop(0) if pending_starts else None
+
+
+def _filter_samples(
+    samples: list[TelemetrySample],
+    start_timestamp_ns: int,
+    end_timestamp_ns: int,
+) -> list[TelemetrySample]:
+    return [
+        sample
+        for sample in samples
+        if start_timestamp_ns <= sample.timestamp_ns <= end_timestamp_ns
+    ]
 
 
 def parse_workload_results(stdout_path: Path) -> list[dict[str, Any]]:
