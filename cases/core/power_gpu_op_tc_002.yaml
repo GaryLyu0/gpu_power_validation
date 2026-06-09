@@ -18,13 +18,25 @@ workload:
     - --dtype
     - bf16
     - --engine
-    - wmma_persistent
+    - cutlass_tile_burn
     - --m
-    - "8192"
+    - "32"
     - --n
-    - "8192"
+    - "16"
     - --k
-    - "8192"
+    - "64"
+    - --synthetic-m
+    - "32"
+    - --synthetic-n
+    - "16"
+    - --synthetic-k
+    - "64"
+    - --cutlass-tile-m
+    - "16"
+    - --cutlass-tile-n
+    - "8"
+    - --cutlass-tile-k
+    - "16"
     - --duty-cycle
     - "{duty_cycle}"
     - --active-sm-fraction
@@ -35,8 +47,6 @@ workload:
     - "6"
     - --mma-iters-per-loop
     - "256"
-    - --accumulators-per-warp
-    - "2"
     - --atomic-period
     - "8192"
     - --sparsity-mode
@@ -78,12 +88,23 @@ clock_control:
   mem_clock_mhz: null
 expected:
   summary: Run Tensor Core duty-cycle sweeps under multiple locked SM clocks.
-  key_metrics: [avg_power_watts_by_clock_and_duty, clock_limit_mhz]
+  key_metrics:
+    - avg_power_watts_by_clock_and_duty
+    - clock_limit_mhz
+    - synthetic_mnk_controls_mma_count
+    - requested_synthetic_tile_ops
+    - distributed_synthetic_ops_per_block
+    - synthetic_mma_ops_per_loop
+    - synthetic_mma_ops_cap_applied
+    - memory_traffic_minimized
   pass_criteria:
     - Each clock point completes all duty-cycle steps on the target server.
     - Clock lock state is recorded with telemetry.
 notes:
-  - This is the locked-frequency version of power_gpu_op_tc_000.
-  - Uses wmma_persistent for fine-grained time-utilization control inside the CUDA kernel with clock64.
+  - This is the locked-clock version of power_gpu_op_tc_000.
+  - It uses the same CUTLASS/CuTe MMA atom synthetic burn workload as power_gpu_op_tc_000.
+  - Clock sweep is the only intended additional variable.
+  - M/N/K are synthetic operation-count parameters, not real GEMM matrix dimensions.
+  - For M=32, N=16, K=64 and atom tile 16x8x16, requested_synthetic_tile_ops should be 16.
   - Do not emulate clock behavior on laptops.
   - Dry-run prints planned clock changes; non-dry-run resolves auto clocks through nvidia-smi on the target server.
