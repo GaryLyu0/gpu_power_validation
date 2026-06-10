@@ -31,6 +31,8 @@ workload:
     - "16"
     - --synthetic-k
     - "64"
+    - --synthetic-mma-ops-per-loop
+    - "256"
     - --cutlass-tile-m
     - "16"
     - --cutlass-tile-n

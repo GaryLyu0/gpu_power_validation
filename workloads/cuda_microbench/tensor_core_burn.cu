@@ -49,6 +49,7 @@ struct Options {
   int synthetic_m = 0;
   int synthetic_n = 0;
   int synthetic_k = 0;
+  int synthetic_mma_ops_per_loop_override = 0;
   std::string sparsity_mode = "none";
   double zero_ratio = 0.0;
   std::string zero_pattern = "regular_k";
@@ -121,6 +122,8 @@ struct Result {
   int synthetic_n_tiles = 0;
   int synthetic_k_tiles = 0;
   std::uint64_t synthetic_mma_ops_per_loop = 0;
+  std::string synthetic_mma_ops_per_loop_source = "";
+  int synthetic_mma_ops_per_loop_override = 0;
   std::uint64_t requested_synthetic_tile_ops = 0;
   std::uint64_t distributed_synthetic_ops_per_block = 0;
   std::uint64_t synthetic_mma_ops_cap = 0;
@@ -292,6 +295,8 @@ Options parse_args(int argc, char** argv) {
       options.synthetic_n = parse_int(require_value(arg), arg);
     } else if (arg == "--synthetic-k") {
       options.synthetic_k = parse_int(require_value(arg), arg);
+    } else if (arg == "--synthetic-mma-ops-per-loop") {
+      options.synthetic_mma_ops_per_loop_override = parse_int(require_value(arg), arg);
     } else if (arg == "--sparsity-mode") {
       options.sparsity_mode = require_value(arg);
     } else if (arg == "--zero-ratio") {
@@ -312,6 +317,7 @@ Options parse_args(int argc, char** argv) {
           << "--atomic-period 1024 "
           << "--cutlass-tile-m 16 --cutlass-tile-n 8 --cutlass-tile-k 16 "
           << "--synthetic-m 8192 --synthetic-n 8192 --synthetic-k 8192 "
+          << "--synthetic-mma-ops-per-loop 256 "
           << "--sparsity-mode none|dense_zero|structured_2to4 "
           << "--zero-ratio 0.0 --zero-pattern regular_k "
           << "--sparse-operand A --sparse-engine cusparselt "
@@ -327,7 +333,9 @@ Options parse_args(int argc, char** argv) {
           << "top-level CUTLASS device::Gemm, does not load real A/B matrices, "
           << "does not use shared-memory A/B tiles, and cutlass-tile-m/n/k "
           << "define synthetic atom grouping rather than real tile-local GEMM "
-          << "storage.\n"
+          << "storage. --synthetic-mma-ops-per-loop manually overrides the "
+          << "actual CuteMmaAtom::fma calls per active loop when small synthetic "
+          << "shapes distribute to too few operations per block.\n"
           << "sparsity-mode=dense_zero inserts zero values into dense cuBLAS operands "
           << "but does not use hardware sparse Tensor Cores.\n"
           << "sparsity-mode=structured_2to4 requires a real sparse backend such as "
@@ -1595,11 +1603,17 @@ Result measure_cutlass_tile_burn(
       std::max<std::uint64_t>(1, (synthetic_tile_ops + grid_blocks - 1) / grid_blocks);
   const std::uint64_t synthetic_mma_ops_cap =
       static_cast<std::uint64_t>(options.mma_iters_per_loop);
-  const bool synthetic_mma_ops_cap_applied = distributed_ops > synthetic_mma_ops_cap;
-  const int synthetic_mma_ops_per_loop =
-      static_cast<int>(std::min<std::uint64_t>(
-          std::max<std::uint64_t>(1, distributed_ops),
-          synthetic_mma_ops_cap));
+  const bool auto_synthetic_mma_ops_cap_applied = distributed_ops > synthetic_mma_ops_cap;
+  bool synthetic_mma_ops_cap_applied = auto_synthetic_mma_ops_cap_applied;
+  int synthetic_mma_ops_per_loop = static_cast<int>(std::min<std::uint64_t>(
+      std::max<std::uint64_t>(1, distributed_ops),
+      synthetic_mma_ops_cap));
+  std::string synthetic_mma_ops_per_loop_source = "auto_distributed";
+  if (options.synthetic_mma_ops_per_loop_override > 0) {
+    synthetic_mma_ops_per_loop = options.synthetic_mma_ops_per_loop_override;
+    synthetic_mma_ops_per_loop_source = "manual_override";
+    synthetic_mma_ops_cap_applied = false;
+  }
 
   constexpr int kWarpsPerBlock = 4;
   constexpr int kValuesPerWarp = 4;
@@ -1689,6 +1703,9 @@ Result measure_cutlass_tile_burn(
     result.synthetic_n_tiles = synthetic_n_tiles;
     result.synthetic_k_tiles = synthetic_k_tiles;
     result.synthetic_mma_ops_per_loop = synthetic_mma_ops_per_loop;
+    result.synthetic_mma_ops_per_loop_source = synthetic_mma_ops_per_loop_source;
+    result.synthetic_mma_ops_per_loop_override =
+        options.synthetic_mma_ops_per_loop_override;
     result.requested_synthetic_tile_ops = synthetic_tile_ops;
     result.distributed_synthetic_ops_per_block = distributed_ops;
     result.synthetic_mma_ops_cap = synthetic_mma_ops_cap;
@@ -1705,15 +1722,23 @@ Result measure_cutlass_tile_burn(
     std::ostringstream note;
     note
         << "cutlass_tile_burn is an experimental CUTLASS/CuTe MMA atom based synthetic Tensor Core burn. It uses a CUTLASS/CuTe SM80 BF16 MMA atom directly in a persistent clock64-controlled kernel, does not use top-level CUTLASS device::Gemm, does not load real A/B matrices, does not use shared-memory A/B tiles, and does not run a real full GEMM shape benchmark. cutlass_tile_m/n/k define synthetic atom grouping, not real tile-local GEMM storage. Current version is register-constant atom burn; a later implementation may add a true tile-local shared-memory CUTLASS/CuTe burn that loads A/B tiles once per CTA and reuses them.";
-    if (synthetic_mma_ops_cap_applied) {
-      note << " synthetic_mma_ops_cap_applied=true because the requested synthetic M/N/K maps to "
+    if (synthetic_mma_ops_per_loop_source == "manual_override") {
+      note << " synthetic_mma_ops_per_loop_source=manual_override, so "
+           << "--synthetic-mma-ops-per-loop directly controls the actual number of "
+           << "CuteMmaAtom::fma calls per active loop.";
+    } else if (synthetic_mma_ops_cap_applied) {
+      note << " synthetic_mma_ops_per_loop_source=auto_distributed and "
+           << "synthetic_mma_ops_cap_applied=true because the requested synthetic M/N/K maps to "
            << distributed_ops << " atom operations per block per loop, exceeding the cap of "
            << synthetic_mma_ops_cap
-           << ". Raise --mma-iters-per-loop if you want the synthetic M/N/K to issue more atoms per loop.";
+           << ". Raise --mma-iters-per-loop if you want the synthetic M/N/K to issue more atoms per loop. "
+           << "Small synthetic shapes may map to only 1 atom per block per loop after distribution across grid_blocks.";
     } else {
-      note << " synthetic_mma_ops_cap_applied=false because the requested synthetic M/N/K maps to "
+      note << " synthetic_mma_ops_per_loop_source=auto_distributed and "
+           << "synthetic_mma_ops_cap_applied=false because the requested synthetic M/N/K maps to "
            << distributed_ops << " atom operations per block per loop within the cap of "
-           << synthetic_mma_ops_cap << ".";
+           << synthetic_mma_ops_cap
+           << ". Small synthetic shapes may map to only 1 atom per block per loop after distribution across grid_blocks.";
     }
     result.note = note.str();
     return result;
@@ -1817,6 +1842,10 @@ void print_json(const Result& result) {
             << "\"synthetic_n_tiles\":" << result.synthetic_n_tiles << ","
             << "\"synthetic_k_tiles\":" << result.synthetic_k_tiles << ","
             << "\"synthetic_mma_ops_per_loop\":" << result.synthetic_mma_ops_per_loop << ","
+            << "\"synthetic_mma_ops_per_loop_source\":\""
+            << result.synthetic_mma_ops_per_loop_source << "\","
+            << "\"synthetic_mma_ops_per_loop_override\":"
+            << result.synthetic_mma_ops_per_loop_override << ","
             << "\"requested_synthetic_tile_ops\":"
             << result.requested_synthetic_tile_ops << ","
             << "\"distributed_synthetic_ops_per_block\":"
