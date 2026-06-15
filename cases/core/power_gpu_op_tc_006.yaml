@@ -1,0 +1,99 @@
+case_id: power_gpu_op_tc_006
+feature_name: AI Core / Tensor Core
+case_name: Tensor Core Strided Batched Tiny GEMM Power @ K Sweep
+title: Tensor Core Strided Batched Tiny GEMM Power @ K Sweep
+category: core
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [7]
+preconditions:
+  - Tensor Core GEMM workload is built on the target H100/B200 server.
+  - GPU 7 is available for tiny GEMM batching tests, or the device argument is overridden before running.
+  - cuBLAS supports BF16 strided batched GEMM with Tensor Core eligible compute on the target server.
+workload:
+  type: command
+  executable: ./build/workloads/tensor_core_burn
+  args:
+    - --device
+    - "7"
+    - --dtype
+    - bf16
+    - --engine
+    - cublas_strided_batched
+    - --m
+    - "128"
+    - --n
+    - "128"
+    - --k
+    - "{k}"
+    - --batch-count
+    - "4096"
+    - --duty-cycle
+    - "1.0"
+    - --active-sm-fraction
+    - "1.0"
+    - --period-ms
+    - "1000"
+    - --sparsity-mode
+    - none
+    - --warmup-sec
+    - "10"
+    - --steady-sec
+    - "30"
+parameters:
+  warmup_sec: 10
+  steady_sec: 30
+  sweep:
+    k:
+      - {label: "k1", value: "1"}
+      - {label: "k2", value: "2"}
+      - {label: "k3", value: "3"}
+      - {label: "k4", value: "4"}
+      - {label: "k5", value: "5"}
+      - {label: "k6", value: "6"}
+      - {label: "k7", value: "7"}
+      - {label: "k8", value: "8"}
+      - {label: "k9", value: "9"}
+      - {label: "k10", value: "10"}
+      - {label: "k11", value: "11"}
+      - {label: "k12", value: "12"}
+      - {label: "k13", value: "13"}
+      - {label: "k14", value: "14"}
+      - {label: "k15", value: "15"}
+      - {label: "k16", value: "16"}
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_gpu_pct
+    - sm_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Sweep K from 1 to 16 for real 128xKx128 strided batched tiny GEMMs at fixed high batch count.
+  key_metrics:
+    - avg_power_watts_by_k
+    - p95_power_watts_by_k
+    - max_power_watts_by_k
+    - scheduled_tflops
+    - batch_count
+    - per_gemm_flops
+    - total_flops_per_call
+    - gemm_semantics
+  pass_criteria:
+    - Summary JSON reports engine="cublas_strided_batched".
+    - Summary JSON reports gemm_semantics="strided_batched_tiny_gemm".
+    - Summary JSON reports batch_count=4096 for every K point.
+    - Sweep power stats contain one entry per K point.
+notes:
+  - tc_006 is the K sweep at fixed high batch_count.
+  - This is a real strided-batched tiny GEMM measurement, not a synthetic Tensor Core-only burn.
+  - It intentionally batches many independent 128xKx128 GEMMs to provide enough work for all SMs.
+  - Results include real A/B reads, C writes, cuBLAS kernel behavior, tail handling, and possible non-aligned Tensor Core behavior for K values below 8 or not divisible by 8.
+  - Do not interpret this case as pure Tensor Core-only power.

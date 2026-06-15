@@ -1,0 +1,96 @@
+case_id: power_gpu_op_tc_007
+feature_name: AI Core / Tensor Core
+case_name: Tensor Core Strided Batched Tiny GEMM Power @ Batch Count Sweep
+title: Tensor Core Strided Batched Tiny GEMM Power @ Batch Count Sweep
+category: core
+platform:
+  targets: [NVIDIA H100, NVIDIA B200]
+  gpus: [7]
+preconditions:
+  - Tensor Core GEMM workload is built on the target H100/B200 server.
+  - GPU 7 is available for tiny GEMM batching tests, or the device argument is overridden before running.
+  - cuBLAS supports BF16 strided batched GEMM with Tensor Core eligible compute on the target server.
+workload:
+  type: command
+  executable: ./build/workloads/tensor_core_burn
+  args:
+    - --device
+    - "7"
+    - --dtype
+    - bf16
+    - --engine
+    - cublas_strided_batched
+    - --m
+    - "128"
+    - --n
+    - "128"
+    - --k
+    - "{k}"
+    - --batch-count
+    - "{batch_count}"
+    - --duty-cycle
+    - "1.0"
+    - --active-sm-fraction
+    - "1.0"
+    - --period-ms
+    - "1000"
+    - --sparsity-mode
+    - none
+    - --warmup-sec
+    - "10"
+    - --steady-sec
+    - "30"
+parameters:
+  warmup_sec: 10
+  steady_sec: 30
+  sweep:
+    k:
+      - {label: "k1", value: "1"}
+      - {label: "k16", value: "16"}
+    batch_count:
+      - {label: "b1", value: "1"}
+      - {label: "b16", value: "16"}
+      - {label: "b64", value: "64"}
+      - {label: "b128", value: "128"}
+      - {label: "b256", value: "256"}
+      - {label: "b512", value: "512"}
+      - {label: "b1024", value: "1024"}
+      - {label: "b2048", value: "2048"}
+      - {label: "b4096", value: "4096"}
+      - {label: "b8192", value: "8192"}
+telemetry:
+  sampler: mock_nvml
+  interval_ms: 500
+  metrics:
+    - timestamp_s
+    - gpu_index
+    - power_watts
+    - utilization_gpu_pct
+    - sm_clock_mhz
+clock_control:
+  enabled: false
+  mode: none
+  sm_clock_mhz: null
+  mem_clock_mhz: null
+expected:
+  summary: Sweep batch_count for K=1 and K=16 tiny GEMMs to find the full-GPU saturation plateau.
+  key_metrics:
+    - avg_power_watts_by_batch_count
+    - p95_power_watts_by_batch_count
+    - max_power_watts_by_batch_count
+    - scheduled_tflops
+    - batch_count
+    - per_gemm_flops
+    - total_flops_per_call
+    - gemm_semantics
+  pass_criteria:
+    - Summary JSON reports engine="cublas_strided_batched".
+    - Summary JSON reports gemm_semantics="strided_batched_tiny_gemm".
+    - Sweep power stats contain separate entries for each K and batch_count combination.
+    - Plateau region is identified from power and throughput on the target H100/B200 server.
+notes:
+  - tc_007 is the batch_count sweep used to find the saturation/plateau point.
+  - This case is a spatial coverage and batching sweep for real tiny GEMMs, not a synthetic Tensor Core-only burn.
+  - batch_count=1 should behave like a single tiny GEMM and may only use a small number of SMs.
+  - Larger batch_count values should increase SM coverage and eventually reach a power/throughput plateau.
+  - Use the plateau region as the full-GPU batched tiny GEMM power result.

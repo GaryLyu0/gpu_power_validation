@@ -23,6 +23,8 @@ implementations are built and validated on the H100/B200 server.
 | `power_gpu_op_tc_003` | core | Tensor Core GEMM spatial coverage sweep under `nvidia-smi` locked GPU clocks selected from `auto_low`, `auto_mid`, and `auto_high`. |
 | `power_gpu_op_tc_004` | core | Tensor Core GEMM Power @ Dense-Zero Input Sparsity using the dense Tensor Core path with `--sparsity-mode dense_zero`, zero-ratio sweep, and `uses_sparse_tensor_core=false`. |
 | `power_gpu_op_tc_005` | core | Tensor Core Sparse GEMM Power @ 2:4 Structured Sparsity using `--sparsity-mode structured_2to4 --sparse-engine cusparselt` when cuSPARSELt is available at build/link time. This is the true sparse Tensor Core execution case; CUTLASS SparseGemm remains future work. |
+| `power_gpu_op_tc_006` | core | Tensor Core Strided Batched Tiny GEMM Power @ K Sweep using `--engine cublas_strided_batched`, real 128xKx128 BF16 tiny GEMMs, K=1..16, and fixed `--batch-count 4096`. |
+| `power_gpu_op_tc_007` | core | Tensor Core Strided Batched Tiny GEMM Power @ Batch Count Sweep using `--engine cublas_strided_batched`, K=1 and K=16, and batch_count from 1 through 8192 to find the saturation plateau. |
 | `power_gpu_op_cc_000` | core | CUDA Core floating-point elementwise power versus time duty cycle using `./build/workloads/cuda_core_burn --mode fp32_fma`. |
 | `power_gpu_op_cc_001` | core | CUDA Core integer/logical elementwise power versus time duty cycle using `./build/workloads/cuda_core_burn --mode int32_logic`. |
 | `power_tdp_000` | real_workload | Command-driven real workload TDP test using `workloads/python/real_workload_stub.py --mode tdp_matmul` by default. |
@@ -49,6 +51,10 @@ are related power dimensions, but they are not interchangeable:
   NVIDIA 2:4 pattern and cuSPARSELt build/link support, and must report
   `uses_sparse_tensor_core=true` only when `cusparseLtMatmul` executes
   successfully.
+- `power_gpu_op_tc_006` and `power_gpu_op_tc_007` are real strided-batched tiny
+  GEMM tests. They include real A/B reads, C writes, cuBLAS batching behavior,
+  and library handling for small or non-aligned K values. They are not
+  synthetic Tensor Core-only burn tests.
 
 When real implementations are added, run target-server validation with commands
 such as:
@@ -64,6 +70,8 @@ python -m runner.run_case --case cases/core/power_gpu_op_tc_002.yaml
 python -m runner.run_case --case cases/core/power_gpu_op_tc_003.yaml
 python -m runner.run_case --case cases/core/power_gpu_op_tc_004.yaml
 python -m runner.run_case --case cases/core/power_gpu_op_tc_005.yaml --dry-run
+python -m runner.run_case --case cases/core/power_gpu_op_tc_006.yaml
+python -m runner.run_case --case cases/core/power_gpu_op_tc_007.yaml
 python -m runner.run_case --case cases/core/power_gpu_op_cc_000.yaml
 python -m runner.run_case --case cases/core/power_gpu_op_cc_001.yaml
 python -m runner.run_suite --case-dir cases
