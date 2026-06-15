@@ -624,12 +624,12 @@ void run_strided_batched_gemm(
     float* c) {
   const float alpha = 1.0f;
   const float beta = 0.0f;
-  const cublasStride_t stride_a =
-      static_cast<cublasStride_t>(options.m) * static_cast<cublasStride_t>(options.k);
-  const cublasStride_t stride_b =
-      static_cast<cublasStride_t>(options.k) * static_cast<cublasStride_t>(options.n);
-  const cublasStride_t stride_c =
-      static_cast<cublasStride_t>(options.m) * static_cast<cublasStride_t>(options.n);
+  const long long int stride_a =
+      static_cast<long long int>(options.m) * static_cast<long long int>(options.k);
+  const long long int stride_b =
+      static_cast<long long int>(options.k) * static_cast<long long int>(options.n);
+  const long long int stride_c =
+      static_cast<long long int>(options.m) * static_cast<long long int>(options.n);
   check_cublas(
       cublasGemmStridedBatchedEx(
           handle,
