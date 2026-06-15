@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -43,6 +44,7 @@ struct Options {
   int mma_iters_per_loop = 64;
   int accumulators_per_warp = 1;
   int atomic_period = 1024;
+  int batch_count = 1;
   int cutlass_tile_m = 16;
   int cutlass_tile_n = 8;
   int cutlass_tile_k = 16;
@@ -81,6 +83,12 @@ struct Result {
   int mma_iters_per_loop = 0;
   int accumulators_per_warp = 0;
   int atomic_period = 0;
+  int batch_count = 1;
+  double per_gemm_flops = 0.0;
+  double total_flops_per_call = 0.0;
+  std::string gemm_semantics = "";
+  std::string expected_use_case = "";
+  std::vector<std::string> warnings;
   int occupancy_max_active_blocks_per_sm = 0;
   int effective_blocks_per_sm_estimate = 0;
   bool occupancy_limited = false;
@@ -158,6 +166,12 @@ Result make_base_result(const Options& options, int requested_sm_count) {
   result.accumulators_per_warp =
       options.engine == "wmma_persistent" ? options.accumulators_per_warp : 0;
   result.atomic_period = options.engine == "wmma_persistent" ? options.atomic_period : 0;
+  result.batch_count = options.batch_count;
+  result.per_gemm_flops =
+      2.0 * static_cast<double>(options.m) * static_cast<double>(options.n) *
+      static_cast<double>(options.k);
+  result.total_flops_per_call =
+      result.per_gemm_flops * static_cast<double>(options.batch_count);
   result.sparsity_mode = options.sparsity_mode;
   result.zero_ratio = options.zero_ratio;
   result.zero_pattern = options.zero_pattern;
@@ -283,6 +297,8 @@ Options parse_args(int argc, char** argv) {
       options.accumulators_per_warp = parse_int(require_value(arg), arg);
     } else if (arg == "--atomic-period") {
       options.atomic_period = parse_int(require_value(arg), arg);
+    } else if (arg == "--batch-count") {
+      options.batch_count = parse_int(require_value(arg), arg);
     } else if (arg == "--cutlass-tile-m") {
       options.cutlass_tile_m = parse_int(require_value(arg), arg);
     } else if (arg == "--cutlass-tile-n") {
@@ -310,11 +326,12 @@ Options parse_args(int argc, char** argv) {
     } else if (arg == "--help") {
       std::cout
           << "Usage: tensor_core_burn --device 0 --dtype bf16 "
-          << "--engine cublas|wmma_persistent|cutlass_tile_burn --m 8192 --n 8192 "
+          << "--engine cublas|cublas_strided_batched|wmma_persistent|cutlass_tile_burn "
+          << "--m 8192 --n 8192 "
           << "--k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 "
           << "--period-ms 1000 --blocks-per-sm 1 "
           << "--mma-iters-per-loop 64 --accumulators-per-warp 1 "
-          << "--atomic-period 1024 "
+          << "--atomic-period 1024 --batch-count 1 "
           << "--cutlass-tile-m 16 --cutlass-tile-n 8 --cutlass-tile-k 16 "
           << "--synthetic-m 8192 --synthetic-n 8192 --synthetic-k 8192 "
           << "--synthetic-mma-ops-per-loop 256 "
@@ -349,9 +366,10 @@ Options parse_args(int argc, char** argv) {
   if (options.dtype != "bf16") {
     throw std::runtime_error("Only --dtype bf16 is supported in this workload");
   }
-  if (options.engine != "cublas" && options.engine != "wmma_persistent" &&
-      options.engine != "cutlass_tile_burn") {
-    throw std::runtime_error("--engine must be cublas, wmma_persistent, or cutlass_tile_burn");
+  if (options.engine != "cublas" && options.engine != "cublas_strided_batched" &&
+      options.engine != "wmma_persistent" && options.engine != "cutlass_tile_burn") {
+    throw std::runtime_error(
+        "--engine must be cublas, cublas_strided_batched, wmma_persistent, or cutlass_tile_burn");
   }
   if (options.duty_cycle < 0.0 || options.duty_cycle > 1.0) {
     throw std::runtime_error("--duty-cycle must be in [0, 1]");
@@ -377,6 +395,9 @@ Options parse_args(int argc, char** argv) {
   }
   if (options.atomic_period <= 0) {
     throw std::runtime_error("--atomic-period must be > 0");
+  }
+  if (options.batch_count <= 0) {
+    throw std::runtime_error("--batch-count must be > 0");
   }
   if (options.cutlass_tile_m <= 0 || options.cutlass_tile_n <= 0 ||
       options.cutlass_tile_k <= 0) {
@@ -595,6 +616,48 @@ void run_gemm(
       "cublasGemmEx");
 }
 
+void run_strided_batched_gemm(
+    cublasHandle_t handle,
+    const Options& options,
+    const __nv_bfloat16* a,
+    const __nv_bfloat16* b,
+    float* c) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  const cublasStride_t stride_a =
+      static_cast<cublasStride_t>(options.m) * static_cast<cublasStride_t>(options.k);
+  const cublasStride_t stride_b =
+      static_cast<cublasStride_t>(options.k) * static_cast<cublasStride_t>(options.n);
+  const cublasStride_t stride_c =
+      static_cast<cublasStride_t>(options.m) * static_cast<cublasStride_t>(options.n);
+  check_cublas(
+      cublasGemmStridedBatchedEx(
+          handle,
+          CUBLAS_OP_N,
+          CUBLAS_OP_N,
+          options.m,
+          options.n,
+          options.k,
+          &alpha,
+          a,
+          CUDA_R_16BF,
+          options.m,
+          stride_a,
+          b,
+          CUDA_R_16BF,
+          options.k,
+          stride_b,
+          &beta,
+          c,
+          CUDA_R_32F,
+          options.m,
+          stride_c,
+          options.batch_count,
+          CUBLAS_COMPUTE_32F_FAST_16BF,
+          CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+      "cublasGemmStridedBatchedEx");
+}
+
 void run_active_window(
     cublasHandle_t handle,
     const Options& options,
@@ -610,6 +673,25 @@ void run_active_window(
                   std::chrono::duration<double>(seconds);
   while (std::chrono::steady_clock::now() < deadline) {
     run_gemm(handle, options, a, b, c);
+    ++iterations;
+  }
+}
+
+void run_strided_batched_active_window(
+    cublasHandle_t handle,
+    const Options& options,
+    const __nv_bfloat16* a,
+    const __nv_bfloat16* b,
+    float* c,
+    double seconds,
+    std::uint64_t& iterations) {
+  if (seconds <= 0.0) {
+    return;
+  }
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::duration<double>(seconds);
+  while (std::chrono::steady_clock::now() < deadline) {
+    run_strided_batched_gemm(handle, options, a, b, c);
     ++iterations;
   }
 }
@@ -747,6 +829,100 @@ Result measure_cublas(
     result.note +=
         " dense_zero inserts zero values into dense operands and does not use hardware sparse Tensor Cores; dense MMA instruction count is unchanged.";
   }
+  return result;
+}
+
+std::vector<std::string> strided_batched_warnings(const Options& options) {
+  std::vector<std::string> warnings;
+  if (options.batch_count == 1 &&
+      (options.m < 256 || options.n < 256 || options.k < 64)) {
+    warnings.push_back(
+        "batch_count is 1 and the GEMM shape is small; a single tiny GEMM may under-utilize SMs");
+  }
+  if ((options.m % 8) != 0 || (options.n % 8) != 0 || (options.k % 8) != 0 ||
+      options.k < 16) {
+    warnings.push_back(
+        "M/N/K are not all multiples of 8 or K is less than 16; this tiny/non-aligned GEMM includes tail, padding, or library behavior");
+  }
+  return warnings;
+}
+
+Result measure_cublas_strided_batched(
+    cublasHandle_t handle,
+    const Options& options,
+    const __nv_bfloat16* a,
+    const __nv_bfloat16* b,
+    float* c,
+    int requested_sm_count,
+    bool sm_count_target_applied) {
+  std::uint64_t warmup_iterations = 0;
+  run_strided_batched_active_window(
+      handle, options, a, b, c, options.warmup_sec, warmup_iterations);
+  check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(strided_batched warmup)");
+
+  if (options.duty_cycle == 0.0) {
+    std::this_thread::sleep_for(std::chrono::duration<double>(options.steady_sec));
+    Result result = make_base_result(options, requested_sm_count);
+    result.actual_elapsed_ms = options.steady_sec * 1000.0;
+    result.duty_control_mode = "cpu_windowed_cublas_strided_batched";
+    result.spatial_control_mode = "cublas_sm_count_target";
+    result.sm_count_target_applied = sm_count_target_applied;
+    result.gemm_semantics = "strided_batched_tiny_gemm";
+    result.matrix_shape_is_real = true;
+    result.expected_use_case = "fills GPU by batching many independent tiny GEMMs";
+    result.warnings = strided_batched_warnings(options);
+    result.note =
+        "cublas_strided_batched uses cublasGemmStridedBatchedEx with BF16 inputs, FP32 output, and Tensor Core eligible BF16 fast compute.";
+    return result;
+  }
+
+  EventPair events;
+  std::uint64_t iterations = 0;
+  const double period_sec = options.period_ms / 1000.0;
+  const double active_sec = period_sec * options.duty_cycle;
+  const double idle_sec = period_sec - active_sec;
+  auto steady_deadline = std::chrono::steady_clock::now() +
+                         std::chrono::duration<double>(options.steady_sec);
+
+  check_cuda(cudaEventRecord(events.start()), "cudaEventRecord(strided_batched start)");
+  while (std::chrono::steady_clock::now() < steady_deadline) {
+    run_strided_batched_active_window(handle, options, a, b, c, active_sec, iterations);
+    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(strided_batched active)");
+    if (idle_sec > 0.0) {
+      std::this_thread::sleep_for(std::chrono::duration<double>(idle_sec));
+    }
+  }
+  check_cuda(cudaEventRecord(events.stop()), "cudaEventRecord(strided_batched stop)");
+  check_cuda(cudaEventSynchronize(events.stop()), "cudaEventSynchronize(strided_batched stop)");
+
+  float elapsed_ms = 0.0f;
+  check_cuda(cudaEventElapsedTime(&elapsed_ms, events.start(), events.stop()),
+             "cudaEventElapsedTime(strided_batched)");
+
+  const double total_flops_per_call =
+      2.0 * static_cast<double>(options.m) * static_cast<double>(options.n) *
+      static_cast<double>(options.k) * static_cast<double>(options.batch_count);
+  const double total_ops = total_flops_per_call * static_cast<double>(iterations);
+  const double active_elapsed_s = std::max(static_cast<double>(elapsed_ms) / 1000.0, 1e-9);
+  Result result = make_base_result(options, requested_sm_count);
+  result.active_elapsed_ms = static_cast<double>(elapsed_ms);
+  result.iterations = iterations;
+  result.active_tflops = total_ops / active_elapsed_s / 1.0e12;
+  result.scheduled_tflops = total_ops / options.steady_sec / 1.0e12;
+  result.actual_elapsed_ms = static_cast<double>(elapsed_ms);
+  result.measured_runtime_ms = static_cast<double>(elapsed_ms);
+  result.dense_baseline_tflops = result.scheduled_tflops;
+  result.sparse_tflops_or_dense_equivalent_tflops = result.scheduled_tflops;
+  result.speedup_vs_dense = 1.0;
+  result.duty_control_mode = "cpu_windowed_cublas_strided_batched";
+  result.spatial_control_mode = "cublas_sm_count_target";
+  result.sm_count_target_applied = sm_count_target_applied;
+  result.gemm_semantics = "strided_batched_tiny_gemm";
+  result.matrix_shape_is_real = true;
+  result.expected_use_case = "fills GPU by batching many independent tiny GEMMs";
+  result.warnings = strided_batched_warnings(options);
+  result.note =
+      "cublas_strided_batched uses cublasGemmStridedBatchedEx with BF16 inputs, FP32 output, and Tensor Core eligible BF16 fast compute. Use batch_count to fill the GPU with many independent tiny GEMMs.";
   return result;
 }
 
@@ -1786,6 +1962,19 @@ void print_json(const Result& result) {
             << "\"mma_iters_per_loop\":" << result.mma_iters_per_loop << ","
             << "\"accumulators_per_warp\":" << result.accumulators_per_warp << ","
             << "\"atomic_period\":" << result.atomic_period << ","
+            << "\"batch_count\":" << result.batch_count << ","
+            << "\"per_gemm_flops\":" << result.per_gemm_flops << ","
+            << "\"total_flops_per_call\":" << result.total_flops_per_call << ","
+            << "\"gemm_semantics\":\"" << result.gemm_semantics << "\","
+            << "\"expected_use_case\":\"" << result.expected_use_case << "\","
+            << "\"warnings\":[";
+  for (std::size_t index = 0; index < result.warnings.size(); ++index) {
+    if (index > 0) {
+      std::cout << ",";
+    }
+    std::cout << "\"" << result.warnings[index] << "\"";
+  }
+  std::cout << "],"
             << "\"occupancy_max_active_blocks_per_sm\":"
             << result.occupancy_max_active_blocks_per_sm << ","
             << "\"effective_blocks_per_sm_estimate\":"
@@ -1900,6 +2089,10 @@ int main(int argc, char** argv) {
       throw std::runtime_error(
           "engine=cutlass_tile_burn is a dense synthetic tile burn and supports --sparsity-mode none only");
     }
+    if (options.engine == "cublas_strided_batched" && options.sparsity_mode != "none") {
+      throw std::runtime_error(
+          "engine=cublas_strided_batched supports --sparsity-mode none only");
+    }
 
     if (options.engine == "wmma_persistent") {
       Result result = measure_wmma_persistent(options, prop, requested_sm_count);
@@ -1921,9 +2114,16 @@ int main(int argc, char** argv) {
     sm_count_target_applied = true;
 #endif
 
-    const std::size_t a_count = static_cast<std::size_t>(options.m) * options.k;
-    const std::size_t b_count = static_cast<std::size_t>(options.k) * options.n;
-    const std::size_t c_count = static_cast<std::size_t>(options.m) * options.n;
+    const std::size_t batch_multiplier =
+        options.engine == "cublas_strided_batched"
+            ? static_cast<std::size_t>(options.batch_count)
+            : 1;
+    const std::size_t a_count =
+        static_cast<std::size_t>(options.m) * options.k * batch_multiplier;
+    const std::size_t b_count =
+        static_cast<std::size_t>(options.k) * options.n * batch_multiplier;
+    const std::size_t c_count =
+        static_cast<std::size_t>(options.m) * options.n * batch_multiplier;
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&a), a_count * sizeof(__nv_bfloat16)),
                "cudaMalloc(a)");
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&b), b_count * sizeof(__nv_bfloat16)),
@@ -1934,7 +2134,7 @@ int main(int argc, char** argv) {
     fill_bf16(
         a,
         options.m,
-        options.k,
+        options.k * static_cast<int>(batch_multiplier),
         options.k,
         false,
         operand_selected(options, "A") ? options.zero_ratio : 0.0,
@@ -1943,7 +2143,7 @@ int main(int argc, char** argv) {
     fill_bf16(
         b,
         options.k,
-        options.n,
+        options.n * static_cast<int>(batch_multiplier),
         options.k,
         true,
         operand_selected(options, "B") ? options.zero_ratio : 0.0,
@@ -1976,6 +2176,18 @@ int main(int argc, char** argv) {
           "built without HAVE_CUSPARSELT and refuses to fall back to dense_zero "
           "or dense GEMM");
 #endif
+      cublasDestroy(handle);
+      cudaFree(a);
+      cudaFree(b);
+      cudaFree(c);
+      return 0;
+    }
+
+    if (options.engine == "cublas_strided_batched") {
+      Result result = measure_cublas_strided_batched(
+          handle, options, a, b, c, requested_sm_count, sm_count_target_applied);
+      print_json(result);
+
       cublasDestroy(handle);
       cudaFree(a);
       cudaFree(b);
