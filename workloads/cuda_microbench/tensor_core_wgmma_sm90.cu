@@ -85,10 +85,10 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
   __shared__ WgmmaSharedStorage storage;
 
   for (int index = threadIdx.x; index < cosize_v<SmemLayoutA>; index += blockDim.x) {
-    storage.a[index] = ElementA(1.0f);
+    storage.a.begin()[index] = ElementA(1.0f);
   }
   for (int index = threadIdx.x; index < cosize_v<SmemLayoutB>; index += blockDim.x) {
-    storage.b[index] = ElementB(1.0f);
+    storage.b.begin()[index] = ElementB(1.0f);
   }
   __syncthreads();
 
@@ -172,10 +172,10 @@ template <int AccumulatorSets>
 __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_correctness_kernel(float* output) {
   __shared__ WgmmaSharedStorage storage;
   for (int index = threadIdx.x; index < cosize_v<SmemLayoutA>; index += blockDim.x) {
-    storage.a[index] = ElementA(1.0f);
+    storage.a.begin()[index] = ElementA(1.0f);
   }
   for (int index = threadIdx.x; index < cosize_v<SmemLayoutB>; index += blockDim.x) {
-    storage.b[index] = ElementB(1.0f);
+    storage.b.begin()[index] = ElementB(1.0f);
   }
   __syncthreads();
 
