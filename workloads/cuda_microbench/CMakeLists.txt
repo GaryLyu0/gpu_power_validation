@@ -48,12 +48,54 @@ target_link_libraries(tma_copy PRIVATE CUDA::cudart)
 target_link_libraries(tensor_core_burn PRIVATE CUDA::cublas)
 
 set(CUTLASS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/cutlass/include")
+set(CUTLASS_SM90_GMMA_HEADER "${CUTLASS_INCLUDE_DIR}/cute/arch/mma_sm90_gmma.hpp")
+set(CUTLASS_SM90_SMEM_HELPER "${CUTLASS_INCLUDE_DIR}/cutlass/gemm/collective/builders/sm90_common.inl")
 if(EXISTS "${CUTLASS_INCLUDE_DIR}/cute/tensor.hpp")
   target_include_directories(tensor_core_burn PRIVATE "${CUTLASS_INCLUDE_DIR}")
   target_compile_definitions(tensor_core_burn PRIVATE HAVE_CUTLASS_CUTE=1)
   message(STATUS "CUTLASS/CuTe tile burn support: ON")
+
+  if(EXISTS "${CUTLASS_SM90_GMMA_HEADER}" AND EXISTS "${CUTLASS_SM90_SMEM_HELPER}")
+    if(CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA" AND
+       CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.0")
+      set(GPU_POWER_NVCC_SUPPORTS_SM90A ON)
+    else()
+      set(GPU_POWER_NVCC_SUPPORTS_SM90A OFF)
+    endif()
+  else()
+    set(GPU_POWER_NVCC_SUPPORTS_SM90A OFF)
+    message(STATUS "Hopper WGMMA support: OFF (vendored CUTLASS lacks required SM90 GMMA headers)")
+  endif()
+  if(GPU_POWER_NVCC_SUPPORTS_SM90A)
+    add_library(tensor_core_wgmma_sm90a OBJECT tensor_core_wgmma_sm90.cu)
+    set_target_properties(
+      tensor_core_wgmma_sm90a
+      PROPERTIES
+        CUDA_ARCHITECTURES OFF
+        POSITION_INDEPENDENT_CODE ON
+    )
+    target_include_directories(
+      tensor_core_wgmma_sm90a
+      PRIVATE
+        "${CUTLASS_INCLUDE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    target_compile_options(
+      tensor_core_wgmma_sm90a
+      PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_90a,code=sm_90a>
+        $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_90a,code=compute_90a>
+    )
+    target_sources(tensor_core_burn PRIVATE $<TARGET_OBJECTS:tensor_core_wgmma_sm90a>)
+    target_compile_definitions(tensor_core_burn PRIVATE HAVE_WGMMA_SM90A=1)
+    message(STATUS "Hopper WGMMA support: ON (tensor_core_wgmma_sm90.cu -> sm_90a + compute_90a)")
+  elseif(EXISTS "${CUTLASS_SM90_GMMA_HEADER}" AND EXISTS "${CUTLASS_SM90_SMEM_HELPER}")
+    message(STATUS "Hopper WGMMA support: OFF (NVIDIA CUDA compiler 12.0+ is required for sm_90a)")
+  endif()
 else()
   message(STATUS "CUTLASS/CuTe tile burn support: OFF")
+  message(STATUS "Hopper WGMMA support: OFF (vendored CUTLASS/CuTe headers unavailable)")
 endif()
 
 set(CUSPARSELT_ROOT "" CACHE PATH "Optional cuSPARSELt installation prefix")

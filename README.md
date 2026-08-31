@@ -232,6 +232,30 @@ active/idle switching cadence; `--blocks-per-sm`, `--mma-iters-per-loop`, and
 validate actual SM activity and Tensor Core utilization with Nsight profiler
 metrics on the H100 server.
 
+The experimental `--engine wgmma_persistent` path is different from both of
+those engines: it is an H100-only SM90a implementation with one 128-thread
+warpgroup per CTA. BF16 A/B tiles are initialized once in shared memory and
+reused by asynchronous `64x64x16` WGMMA operations. Phase 1 supports only
+`--duty-cycle 1.0`; it uses no TMA, performs no steady-state global A/B loads,
+and derives TFLOPS from the actual completed WGMMA count. The existing
+`cutlass_tile_burn` remains an SM80-style CuTe MMA atom burn, while
+`wmma_persistent` remains a 32-thread warp-level WMMA path.
+
+On H100, CMake must print `Hopper WGMMA support: ON`; the dedicated WGMMA
+translation unit is compiled for `sm_90a` while other workloads retain
+`CUDA_ARCHITECTURES=90`:
+
+```bash
+CUDA_ARCHITECTURES=90 bash scripts/build_workloads.sh
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 0.1 --blocks-per-sm 1 --wgmma-ops-per-check 512 --wgmma-wait-group 1 --wgmma-accumulator-sets 2 --warmup-sec 1 --steady-sec 2
+cuobjdump --dump-sass build/workloads/tensor_core_burn | grep -E 'HGMMA|WGMMA'
+cuobjdump --dump-ptx build/workloads/tensor_core_burn | grep -E 'wgmma\\.mma_async'
+```
+
+See [workloads/cuda_microbench/README.md](workloads/cuda_microbench/README.md)
+for full-GPU, residency, WMMA comparison, and Nsight Compute commands. WGMMA
+runtime behavior and power remain H100-side validation items.
+
 Tensor Core power has separate test dimensions that should not be mixed:
 
 - `power_gpu_op_tc_001` is active SM spatial coverage. It changes

@@ -54,7 +54,8 @@ changes the active memory range.
 
 ## tensor_core_burn
 
-`tensor_core_burn.cu` implements the base Tensor Core cases with two engines:
+`tensor_core_burn` implements the base Tensor Core cases with several independent
+engines:
 
 - `--engine cublas` keeps the original cuBLAS BF16 GEMM behavior and remains
   the default for backward compatibility.
@@ -65,9 +66,16 @@ changes the active memory range.
   synthetic Tensor Core burn. It calls the SM80 BF16 MMA atom directly, does not
   use top-level `cutlass::gemm::device::Gemm`, does not load real A/B matrices,
   and does not use shared-memory A/B tiles.
+- `--engine wgmma_persistent` is an H100-only SM90a backend. One 128-thread CTA
+  forms one four-warp warpgroup and repeatedly issues asynchronous
+  `64x64x16` BF16 x BF16 -> FP32 WGMMA operations from shared-memory-resident
+  A/B tiles.
 
-CUTLASS integration remains optional for a later step and is not required by
-these cases.
+The WGMMA source is compiled separately for `sm_90a`; the existing targets keep
+their configured architecture list. CMake prints `Hopper WGMMA support: ON`
+when the vendored CuTe headers and an SM90a-capable CUDA compiler are available.
+If support is unavailable, the other engines still build and requesting
+`wgmma_persistent` fails without falling back to another execution path.
 
 Current Tensor Core limitations:
 
@@ -92,6 +100,10 @@ Current Tensor Core limitations:
   `uses_shared_memory_tiles=false`. A later implementation may add a true
   tile-local shared-memory CUTLASS/CuTe burn that loads A/B tiles once per CTA
   and reuses them; the current version is register-constant atom burn.
+- For `wgmma_persistent`, `m`, `n`, and `k` are retained for CLI compatibility
+  but do not determine executed work. TFLOPS are calculated from the completed
+  `64x64x16` WGMMA count. Phase 1 is BF16-only and accepts only
+  `--duty-cycle 1.0`.
 - Validate actual spatial coverage and Tensor Core utilization with Nsight
   profiler metrics on the H100 server for both engines.
 - `wmma_persistent` reports `occupancy_max_active_blocks_per_sm`,
@@ -141,6 +153,64 @@ excluded from `measured_runtime_ms`.
 ./build/workloads/tensor_core_burn --device 4 --dtype bf16 --engine wmma_persistent --m 16384 --n 16384 --k 16384 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 6 --mma-iters-per-loop 256 --accumulators-per-warp 2 --atomic-period 8192 --warmup-sec 5 --steady-sec 20
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cutlass_tile_burn --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 2 --mma-iters-per-loop 256 --cutlass-tile-m 64 --cutlass-tile-n 64 --cutlass-tile-k 32 --sparsity-mode none --warmup-sec 5 --steady-sec 10
 ```
+
+### Hopper WGMMA phase 1
+
+`wgmma_persistent` is a synthetic Tensor Core power workload, not a GEMM shape
+benchmark. At CTA startup, 128 threads initialize deterministic BF16 A and B
+tiles directly in shared memory. The persistent region reuses those tiles for
+SM90a WGMMA and performs no TMA transfers, no global A/B loads, no global
+atomics, and no global stores. After draining all outstanding WGMMA groups, one
+counter and one accumulator sample per CTA are written to global memory.
+
+The default two accumulator sets alternate to reduce a single-accumulator
+dependency chain. `--wgmma-wait-group 1` permits one committed group to remain
+outstanding; supported phase-1 wait/accumulator pairs are `0/1`, `0/2`, and
+`1/2`. `--wgmma-ops-per-check` controls how many operations execute between
+warpgroup-uniform `clock64` termination checks. `--active-sm-fraction` and
+`--blocks-per-sm` control grid size, but CUDA scheduling only approximates SM
+coverage and does not select specific SM IDs.
+
+Functional smoke on H100:
+
+```bash
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 0.1 --blocks-per-sm 1 --wgmma-ops-per-check 512 --wgmma-wait-group 1 --wgmma-accumulator-sets 2 --sparsity-mode none --warmup-sec 1 --steady-sec 2
+```
+
+Full-GPU and residency comparison:
+
+```bash
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 1.0 --blocks-per-sm 1 --wgmma-ops-per-check 512 --wgmma-wait-group 1 --wgmma-accumulator-sets 2 --sparsity-mode none --warmup-sec 5 --steady-sec 20
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 1.0 --blocks-per-sm 2 --wgmma-ops-per-check 512 --wgmma-wait-group 1 --wgmma-accumulator-sets 2 --sparsity-mode none --warmup-sec 5 --steady-sec 20
+```
+
+Verify the generated code after the H100 build. The CMake target embeds both
+SM90a machine code and compute_90a PTX in the executable:
+
+```bash
+cuobjdump --dump-sass build/workloads/tensor_core_burn | grep -E 'HGMMA|WGMMA'
+cuobjdump --dump-ptx build/workloads/tensor_core_burn | grep -E 'wgmma\\.mma_async'
+```
+
+Do not infer WGMMA execution from C++ type names alone. The first command should
+show Hopper `HGMMA` instructions and the second should show
+`wgmma.mma_async` PTX. Absence of both is a failed WGMMA build validation.
+
+Nsight Compute metric names vary by installed version. Discover available
+metrics first, then profile comparable full-duty runs:
+
+```bash
+ncu --query-metrics | grep -Ei 'tensor|mma|wgmma|hmma|dram|l2|shared|occupancy'
+ncu --set full --target-processes all -o results/ncu_wgmma ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 1.0 --blocks-per-sm 1 --warmup-sec 1 --steady-sec 5
+ncu --set full --target-processes all -o results/ncu_wmma ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 1.0 --blocks-per-sm 1 --mma-iters-per-loop 512 --warmup-sec 1 --steady-sec 5
+ncu --set full --target-processes all -o results/ncu_cutlass_atom ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cutlass_tile_burn --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 1.0 --blocks-per-sm 1 --synthetic-mma-ops-per-loop 512 --warmup-sec 1 --steady-sec 5
+```
+
+Compare Tensor Core/MMA utilization, achieved TFLOPS, SM utilization, DRAM and
+L2 traffic, global load/store traffic, shared-memory activity, register use,
+and occupancy. The intended result is higher sustained Hopper Tensor Core
+utilization without meaningful HBM or TMA traffic; that claim requires H100
+profiler and board-power measurements.
 
 `cutlass_tile_burn` cap validation examples:
 
