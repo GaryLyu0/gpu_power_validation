@@ -102,7 +102,7 @@ Current Tensor Core limitations:
   and reuses them; the current version is register-constant atom burn.
 - For `wgmma_persistent`, `m`, `n`, and `k` are retained for CLI compatibility
   but do not determine executed work. TFLOPS are calculated from the completed
-  `64x64x16` WGMMA count. Phase 1 is BF16-only and accepts only
+  `64x64x16` WGMMA count. Phase 2 remains BF16-only and accepts only
   `--duty-cycle 1.0`.
 - Validate actual spatial coverage and Tensor Core utilization with Nsight
   profiler metrics on the H100 server for both engines.
@@ -154,7 +154,7 @@ excluded from `measured_runtime_ms`.
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine cutlass_tile_burn --m 8192 --n 8192 --k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 --period-ms 500 --blocks-per-sm 2 --mma-iters-per-loop 256 --cutlass-tile-m 64 --cutlass-tile-n 64 --cutlass-tile-k 32 --sparsity-mode none --warmup-sec 5 --steady-sec 10
 ```
 
-### Hopper WGMMA phase 1
+### Hopper WGMMA phase 2
 
 `wgmma_persistent` is a synthetic Tensor Core power workload, not a GEMM shape
 benchmark. At CTA startup, 128 threads initialize deterministic BF16 A and B
@@ -163,13 +163,28 @@ SM90a WGMMA and performs no TMA transfers, no global A/B loads, no global
 atomics, and no global stores. After draining all outstanding WGMMA groups, one
 counter and one accumulator sample per CTA are written to global memory.
 
-The default two accumulator sets alternate to reduce a single-accumulator
-dependency chain. `--wgmma-wait-group 1` permits one committed group to remain
-outstanding; supported phase-1 wait/accumulator pairs are `0/1`, `0/2`, and
-`1/2`. `--wgmma-ops-per-check` controls how many operations execute between
-warpgroup-uniform `clock64` termination checks. `--active-sm-fraction` and
-`--blocks-per-sm` control grid size, but CUDA scheduling only approximates SM
-coverage and does not select specific SM IDs.
+Phase 2 supports one through four compile-time-specialized accumulator sets and
+wait depths zero through three, with `wait_group < accumulator_sets`. Each
+specialization has independent named FP32 fragments; there is no runtime-indexed
+accumulator array. The `2/1` configuration is the Phase-1 baseline. The primary
+new comparisons are `3/2` and `4/3`, plus shallower waits for diagnosing
+register pressure versus asynchronous WGMMA concurrency.
+
+`--wgmma-ops-per-check` controls how many operations execute between coarse,
+warpgroup-uniform termination checks. These checks read PTX `%globaltimer`, a
+device-wide nanosecond timebase that does not scale with SM DVFS. JSON reports
+`timer_source=ptx_globaltimer_ns`, `requested_duration_ms`, and the measured
+CUDA-event `actual_elapsed_ms`.
+
+The selected kernel specialization also reports `registers_per_thread`,
+`local_memory_bytes_per_thread`, `occupancy_max_active_blocks_per_sm`,
+`effective_blocks_per_sm_estimate`, and
+`allows_at_least_two_resident_ctas_per_sm`. A warning is emitted when resource
+limits prevent two resident CTAs per SM or CUDA reports local memory. CMake
+enables ptxas verbose output for the SM90a translation unit so spill loads and
+stores can be checked at build time. `--active-sm-fraction` and
+`--blocks-per-sm` still control grid size, but CUDA scheduling only approximates
+SM coverage and does not select specific SM IDs.
 
 Functional smoke on H100:
 
@@ -183,6 +198,30 @@ Full-GPU and residency comparison:
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 1.0 --blocks-per-sm 1 --wgmma-ops-per-check 512 --wgmma-wait-group 1 --wgmma-accumulator-sets 2 --sparsity-mode none --warmup-sec 5 --steady-sec 20
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 1.0 --blocks-per-sm 2 --wgmma-ops-per-check 512 --wgmma-wait-group 1 --wgmma-accumulator-sets 2 --sparsity-mode none --warmup-sec 5 --steady-sec 20
 ```
+
+Build with resource diagnostics and run the Phase-2 ILP matrix. Do not infer a
+performance improvement until these variants are measured on H100:
+
+```bash
+CUDA_ARCHITECTURES=90 bash scripts/build_workloads.sh 2>&1 | tee build/wgmma_phase2_build.log
+grep -Ei 'Used [0-9]+ registers|spill|local' build/wgmma_phase2_build.log
+
+for pair in "2 1" "3 1" "3 2" "4 1" "4 2" "4 3"; do
+  set -- ${pair}
+  echo "=== accumulators=$1 wait_group=$2 ==="
+  ./build/workloads/tensor_core_burn \
+    --device 0 --dtype bf16 --engine wgmma_persistent \
+    --m 64 --n 64 --k 16 \
+    --duty-cycle 1.0 --active-sm-fraction 1.0 --blocks-per-sm 2 \
+    --wgmma-ops-per-check 2048 \
+    --wgmma-accumulator-sets "$1" --wgmma-wait-group "$2" \
+    --sparsity-mode none --warmup-sec 5 --steady-sec 10
+done
+```
+
+For each result, require real HGMMA, inspect ptxas for zero spill loads/stores,
+check `local_memory_bytes_per_thread`, and confirm
+`occupancy_max_active_blocks_per_sm >= 2` before comparing TFLOPS or power.
 
 Verify the generated code after the H100 build. The CMake target embeds both
 SM90a machine code and compute_90a PTX in the executable:

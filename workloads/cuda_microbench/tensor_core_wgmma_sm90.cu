@@ -51,7 +51,7 @@ using SmemLayoutB = decltype(tile_to_shape(SmemLayoutAtomB{}, Shape<_64, _16>{})
 struct alignas(128) WgmmaSharedStorage {
   ArrayEngine<ElementA, cosize_v<SmemLayoutA>> a;
   ArrayEngine<ElementB, cosize_v<SmemLayoutB>> b;
-  unsigned long long start_cycle;
+  unsigned long long start_time_ns;
   int continue_running;
 };
 
@@ -61,6 +61,12 @@ void check_cuda(cudaError_t status, const char* call) {
     message << call << " failed: " << cudaGetErrorString(status);
     throw std::runtime_error(message.str());
   }
+}
+
+__device__ __forceinline__ unsigned long long read_globaltimer_ns() {
+  unsigned long long timestamp_ns = 0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp_ns));
+  return timestamp_ns;
 }
 
 template <int WaitGroup>
@@ -88,7 +94,7 @@ CUTE_DEVICE void issue_wgmma_group(
 
 template <int AccumulatorSets, int WaitGroup>
 __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
-    unsigned long long duration_cycles,
+    unsigned long long duration_ns,
     int ops_per_check,
     unsigned long long* cta_op_counts,
     float* cta_outputs) {
@@ -134,7 +140,7 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
   }
 
   if (threadIdx.x == 0) {
-    storage.start_cycle = clock64();
+    storage.start_time_ns = read_globaltimer_ns();
     storage.continue_running = 1;
   }
   __syncthreads();
@@ -187,7 +193,7 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
     if (threadIdx.x == 0) {
       completed_ops += static_cast<unsigned long long>(ops_per_check);
       storage.continue_running =
-          (clock64() - storage.start_cycle) < duration_cycles ? 1 : 0;
+          (read_globaltimer_ns() - storage.start_time_ns) < duration_ns ? 1 : 0;
     }
     __syncthreads();
   }
@@ -313,13 +319,13 @@ KernelResourceReport query_kernel_resources_dispatch(
 template <int AccumulatorSets, int WaitGroup>
 void launch_persistent(
     int grid_blocks,
-    unsigned long long duration_cycles,
+    unsigned long long duration_ns,
     int ops_per_check,
     unsigned long long* cta_op_counts,
     float* cta_outputs) {
   wgmma_persistent_kernel<AccumulatorSets, WaitGroup>
       <<<grid_blocks, kWarpgroupThreads>>>(
-          duration_cycles,
+          duration_ns,
           ops_per_check,
           cta_op_counts,
           cta_outputs);
@@ -330,33 +336,33 @@ template <int AccumulatorSets>
 void launch_wait_group_dispatch(
     int wait_group,
     int grid_blocks,
-    unsigned long long duration_cycles,
+    unsigned long long duration_ns,
     int ops_per_check,
     unsigned long long* cta_op_counts,
     float* cta_outputs) {
   switch (wait_group) {
     case 0:
       launch_persistent<AccumulatorSets, 0>(
-          grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+          grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
       return;
     case 1:
       if constexpr (AccumulatorSets >= 2) {
         launch_persistent<AccumulatorSets, 1>(
-            grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+            grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
         return;
       }
       break;
     case 2:
       if constexpr (AccumulatorSets >= 3) {
         launch_persistent<AccumulatorSets, 2>(
-            grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+            grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
         return;
       }
       break;
     case 3:
       if constexpr (AccumulatorSets >= 4) {
         launch_persistent<AccumulatorSets, 3>(
-            grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+            grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
         return;
       }
       break;
@@ -369,23 +375,23 @@ void launch_persistent_dispatch(
     int accumulator_sets,
     int wait_group,
     int grid_blocks,
-    unsigned long long duration_cycles,
+    unsigned long long duration_ns,
     int ops_per_check,
     unsigned long long* cta_op_counts,
     float* cta_outputs) {
   switch (accumulator_sets) {
     case 1:
       return launch_wait_group_dispatch<1>(
-          wait_group, grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+          wait_group, grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
     case 2:
       return launch_wait_group_dispatch<2>(
-          wait_group, grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+          wait_group, grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
     case 3:
       return launch_wait_group_dispatch<3>(
-          wait_group, grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+          wait_group, grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
     case 4:
       return launch_wait_group_dispatch<4>(
-          wait_group, grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+          wait_group, grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
   }
   throw std::runtime_error("wgmma_persistent supports one through four accumulator sets");
 }
@@ -413,16 +419,12 @@ double run_correctness_smoke() {
   }
 }
 
-unsigned long long duration_to_cycles(int device, double seconds) {
-  int clock_rate_khz = 0;
-  check_cuda(
-      cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, device),
-      "cudaDeviceGetAttribute(cudaDevAttrClockRate)");
-  if (clock_rate_khz <= 0) {
-    throw std::runtime_error("Invalid cudaDevAttrClockRate for wgmma_persistent");
+unsigned long long duration_to_nanoseconds(double seconds) {
+  const double duration_ns = seconds * 1.0e9;
+  if (duration_ns <= 0.0) {
+    throw std::runtime_error("WGMMA duration must be positive");
   }
-  return static_cast<unsigned long long>(
-      seconds * static_cast<double>(clock_rate_khz) * 1000.0);
+  return static_cast<unsigned long long>(duration_ns);
 }
 
 }  // namespace
@@ -444,6 +446,7 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
       query_kernel_resources_dispatch(options.accumulator_sets, options.wait_group);
 
   WgmmaRunResult result;
+  result.requested_duration_ms = options.steady_sec * 1000.0;
   result.grid_blocks = grid_blocks;
   result.occupancy_max_active_blocks_per_sm =
       kernel_resources.occupancy_max_active_blocks_per_sm;
@@ -483,7 +486,7 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
           options.accumulator_sets,
           options.wait_group,
           grid_blocks,
-          duration_to_cycles(options.device, options.warmup_sec),
+          duration_to_nanoseconds(options.warmup_sec),
           options.ops_per_check,
           device_counts,
           device_outputs);
@@ -499,7 +502,7 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
         options.accumulator_sets,
         options.wait_group,
         grid_blocks,
-        duration_to_cycles(options.device, options.steady_sec),
+        duration_to_nanoseconds(options.steady_sec),
         options.ops_per_check,
         device_counts,
         device_outputs);

@@ -81,6 +81,8 @@ struct Result {
   double scheduled_tflops = 0.0;
   double period_ms = 0.0;
   double actual_elapsed_ms = 0.0;
+  std::string timer_source = "";
+  double requested_duration_ms = 0.0;
   std::string duty_control_mode;
   std::string spatial_control_mode;
   bool sm_count_target_applied = false;
@@ -395,12 +397,15 @@ Options parse_args(int argc, char** argv) {
           << "engine=wgmma_persistent is Hopper H100/SM90a only. It launches "
           << "one 128-thread warpgroup per CTA and executes asynchronous BF16 "
           << "SM90a WGMMA from A/B tiles initialized once in shared memory. "
-          << "Phase 1 requires --duty-cycle 1.0, uses no TMA, performs no "
+          << "Phase 2 still requires --duty-cycle 1.0, uses no TMA, performs no "
           << "steady-state global A/B loads, and counts FLOPs from actual "
           << "64x64x16 WGMMA operations. --wgmma-ops-per-check sets the "
           << "coarse timer-check batch. Accumulator count is compile-time "
           << "specialized from 1 through 4; wait group supports 0 through 3 "
           << "and must be smaller than accumulator count.\n"
+          << "WGMMA duration checks use the device-wide PTX globaltimer "
+          << "nanosecond timebase at coarse batch boundaries, independent of "
+          << "SM clock DVFS.\n"
           << "sparsity-mode=dense_zero inserts zero values into dense cuBLAS operands "
           << "but does not use hardware sparse Tensor Cores.\n"
           << "sparsity-mode=structured_2to4 requires a real sparse backend such as "
@@ -482,11 +487,11 @@ Options parse_args(int argc, char** argv) {
   }
   if (options.engine == "wgmma_persistent" && options.sparsity_mode != "none") {
     throw std::runtime_error(
-        "engine=wgmma_persistent phase 1 supports --sparsity-mode none only");
+        "engine=wgmma_persistent phase 2 supports --sparsity-mode none only");
   }
   if (options.engine == "wgmma_persistent" && options.duty_cycle != 1.0) {
     throw std::runtime_error(
-        "wgmma_persistent phase 1 currently supports duty_cycle=1.0 only; "
+        "wgmma_persistent phase 2 currently supports duty_cycle=1.0 only; "
         "warpgroup-uniform duty-cycle control will be implemented separately");
   }
   return options;
@@ -2024,6 +2029,8 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   Result result = make_base_result(options, requested_sm_count);
   result.active_elapsed_ms = run_result.actual_elapsed_ms;
   result.actual_elapsed_ms = run_result.actual_elapsed_ms;
+  result.timer_source = run_result.timer_source;
+  result.requested_duration_ms = run_result.requested_duration_ms;
   result.measured_runtime_ms = run_result.actual_elapsed_ms;
   result.iterations = run_result.wgmma_ops_executed;
   result.active_tflops = run_result.actual_elapsed_ms > 0.0
@@ -2097,7 +2104,7 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   result.correctness_observed = run_result.correctness_observed;
   result.correctness_abs_error = run_result.correctness_abs_error;
   result.note =
-      "wgmma_persistent phase 2 uses one 128-thread warpgroup per CTA, BF16 A/B tiles initialized once in shared memory, compile-time-specialized independent FP32 accumulators, no TMA, no steady-state global A/B loads, no hot-loop atomics, and a coarse warpgroup-uniform timer check. wait_group is always smaller than accumulator_sets so an accumulator is not reused while its prior WGMMA group can remain pending. The requested duration begins after in-kernel shared-memory and descriptor setup, while actual_elapsed_ms conservatively includes that small one-time startup. m/n/k are retained only for CLI compatibility and do not determine executed work. blocks_per_sm is requested launch density; CUDA block scheduling approximates active-SM coverage and does not guarantee specific SM IDs.";
+      "wgmma_persistent phase 2 uses one 128-thread warpgroup per CTA, BF16 A/B tiles initialized once in shared memory, compile-time-specialized independent FP32 accumulators, no TMA, no steady-state global A/B loads, no hot-loop atomics, and a coarse warpgroup-uniform timer check. wait_group is always smaller than accumulator_sets so an accumulator is not reused while its prior WGMMA group can remain pending. Requested duration uses the device-wide PTX globaltimer nanosecond timebase after in-kernel shared-memory and descriptor setup; actual_elapsed_ms comes from CUDA events and conservatively includes that small one-time startup. m/n/k are retained only for CLI compatibility and do not determine executed work. blocks_per_sm is requested launch density; CUDA block scheduling approximates active-SM coverage and does not guarantee specific SM IDs.";
   return result;
 }
 #else
@@ -2125,6 +2132,8 @@ void print_json(const Result& result) {
             << "\"engine\":\"" << result.engine << "\","
             << "\"period_ms\":" << result.period_ms << ","
             << "\"actual_elapsed_ms\":" << result.actual_elapsed_ms << ","
+            << "\"timer_source\":\"" << result.timer_source << "\","
+            << "\"requested_duration_ms\":" << result.requested_duration_ms << ","
             << "\"duty_control_mode\":\"" << result.duty_control_mode << "\","
             << "\"spatial_control_mode\":\"" << result.spatial_control_mode << "\","
             << "\"sm_count_target_applied\":"

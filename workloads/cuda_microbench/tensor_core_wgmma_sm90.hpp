@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace gpu_power_validation {
 
@@ -18,6 +19,8 @@ struct WgmmaRunOptions {
 
 struct WgmmaRunResult {
   std::uint64_t wgmma_ops_executed = 0;
+  std::string timer_source = "ptx_globaltimer_ns";
+  double requested_duration_ms = 0.0;
   double actual_elapsed_ms = 0.0;
   int grid_blocks = 0;
   int occupancy_max_active_blocks_per_sm = 0;

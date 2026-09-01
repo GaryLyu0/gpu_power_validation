@@ -235,11 +235,19 @@ metrics on the H100 server.
 The experimental `--engine wgmma_persistent` path is different from both of
 those engines: it is an H100-only SM90a implementation with one 128-thread
 warpgroup per CTA. BF16 A/B tiles are initialized once in shared memory and
-reused by asynchronous `64x64x16` WGMMA operations. Phase 1 supports only
+reused by asynchronous `64x64x16` WGMMA operations. Phase 2 still supports only
 `--duty-cycle 1.0`; it uses no TMA, performs no steady-state global A/B loads,
 and derives TFLOPS from the actual completed WGMMA count. The existing
 `cutlass_tile_burn` remains an SM80-style CuTe MMA atom burn, while
 `wmma_persistent` remains a 32-thread warp-level WMMA path.
+
+Phase 2 retains those workload boundaries and adds compile-time-specialized
+two-, three-, and four-accumulator ILP variants with WGMMA wait depths zero
+through three. The selected variant reports register count, local-memory bytes,
+occupancy, and whether two CTAs per SM are expected to fit. Duration checks use
+the device-wide PTX `%globaltimer` nanosecond timebase rather than converting
+seconds with an SM clock rate; JSON reports both requested and CUDA-event
+duration. The `2/1` accumulator/wait pair remains the Phase-1 baseline.
 
 On H100, CMake must print `Hopper WGMMA support: ON`; the dedicated WGMMA
 translation unit is compiled for `sm_90a` while other workloads retain
