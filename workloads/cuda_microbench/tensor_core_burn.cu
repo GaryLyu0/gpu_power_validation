@@ -98,6 +98,9 @@ struct Result {
   int occupancy_max_active_blocks_per_sm = 0;
   int effective_blocks_per_sm_estimate = 0;
   bool occupancy_limited = false;
+  int registers_per_thread = 0;
+  std::uint64_t local_memory_bytes_per_thread = 0;
+  bool allows_at_least_two_resident_ctas_per_sm = false;
   double spatial_coverage_fraction = 0.0;
   std::string sparsity_test_dimension = "none";
   std::string tensor_core_execution_path = "dense_tensor_core";
@@ -395,8 +398,9 @@ Options parse_args(int argc, char** argv) {
           << "Phase 1 requires --duty-cycle 1.0, uses no TMA, performs no "
           << "steady-state global A/B loads, and counts FLOPs from actual "
           << "64x64x16 WGMMA operations. --wgmma-ops-per-check sets the "
-          << "coarse timer-check batch; supported wait-group/accumulator-set "
-          << "pairs are 0/1, 0/2, and 1/2.\n"
+          << "coarse timer-check batch. Accumulator count is compile-time "
+          << "specialized from 1 through 4; wait group supports 0 through 3 "
+          << "and must be smaller than accumulator count.\n"
           << "sparsity-mode=dense_zero inserts zero values into dense cuBLAS operands "
           << "but does not use hardware sparse Tensor Cores.\n"
           << "sparsity-mode=structured_2to4 requires a real sparse backend such as "
@@ -444,11 +448,11 @@ Options parse_args(int argc, char** argv) {
   if (options.batch_count <= 0) {
     throw std::runtime_error("--batch-count must be > 0");
   }
-  if (options.wgmma_wait_group != 0 && options.wgmma_wait_group != 1) {
-    throw std::runtime_error("--wgmma-wait-group must be 0 or 1 in phase 1");
+  if (options.wgmma_wait_group < 0 || options.wgmma_wait_group > 3) {
+    throw std::runtime_error("--wgmma-wait-group must be in [0, 3]");
   }
-  if (options.wgmma_accumulator_sets != 1 && options.wgmma_accumulator_sets != 2) {
-    throw std::runtime_error("--wgmma-accumulator-sets must be 1 or 2 in phase 1");
+  if (options.wgmma_accumulator_sets < 1 || options.wgmma_accumulator_sets > 4) {
+    throw std::runtime_error("--wgmma-accumulator-sets must be in [1, 4]");
   }
   if (options.wgmma_wait_group >= options.wgmma_accumulator_sets) {
     throw std::runtime_error(
@@ -2036,6 +2040,25 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   result.effective_blocks_per_sm_estimate =
       run_result.effective_blocks_per_sm_estimate;
   result.occupancy_limited = run_result.occupancy_limited;
+  result.registers_per_thread = run_result.registers_per_thread;
+  result.local_memory_bytes_per_thread =
+      static_cast<std::uint64_t>(run_result.local_memory_bytes_per_thread);
+  result.allows_at_least_two_resident_ctas_per_sm =
+      run_result.allows_at_least_two_resident_ctas_per_sm;
+  if (!result.allows_at_least_two_resident_ctas_per_sm) {
+    std::ostringstream warning;
+    warning << "Selected WGMMA accumulator/wait specialization supports only "
+            << result.occupancy_max_active_blocks_per_sm
+            << " active CTA(s) per SM by CUDA occupancy calculation; Phase 2 targets at least 2.";
+    result.warnings.push_back(warning.str());
+  }
+  if (result.local_memory_bytes_per_thread > 0) {
+    std::ostringstream warning;
+    warning << "Selected WGMMA specialization reports "
+            << result.local_memory_bytes_per_thread
+            << " local-memory byte(s) per thread; inspect ptxas spill diagnostics before using power results.";
+    result.warnings.push_back(warning.str());
+  }
   result.gemm_semantics = "persistent_sm90a_wgmma_instruction_burn";
   result.expected_use_case =
       "isolates Hopper Tensor Core pressure with shared-memory-resident operands";
@@ -2074,7 +2097,7 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   result.correctness_observed = run_result.correctness_observed;
   result.correctness_abs_error = run_result.correctness_abs_error;
   result.note =
-      "wgmma_persistent phase 1 uses one 128-thread warpgroup per CTA, BF16 A/B tiles initialized once in shared memory, FP32 accumulation, no TMA, no steady-state global A/B loads, no hot-loop atomics, and a coarse warpgroup-uniform timer check. The requested duration begins after in-kernel shared-memory and descriptor setup, while actual_elapsed_ms conservatively includes that small one-time startup. m/n/k are retained only for CLI compatibility and do not determine executed work. blocks_per_sm is requested launch density; CUDA block scheduling approximates active-SM coverage and does not guarantee specific SM IDs.";
+      "wgmma_persistent phase 2 uses one 128-thread warpgroup per CTA, BF16 A/B tiles initialized once in shared memory, compile-time-specialized independent FP32 accumulators, no TMA, no steady-state global A/B loads, no hot-loop atomics, and a coarse warpgroup-uniform timer check. wait_group is always smaller than accumulator_sets so an accumulator is not reused while its prior WGMMA group can remain pending. The requested duration begins after in-kernel shared-memory and descriptor setup, while actual_elapsed_ms conservatively includes that small one-time startup. m/n/k are retained only for CLI compatibility and do not determine executed work. blocks_per_sm is requested launch density; CUDA block scheduling approximates active-SM coverage and does not guarantee specific SM IDs.";
   return result;
 }
 #else
@@ -2130,6 +2153,12 @@ void print_json(const Result& result) {
             << result.effective_blocks_per_sm_estimate << ","
             << "\"occupancy_limited\":"
             << (result.occupancy_limited ? "true" : "false") << ","
+            << "\"registers_per_thread\":" << result.registers_per_thread << ","
+            << "\"local_memory_bytes_per_thread\":"
+            << result.local_memory_bytes_per_thread << ","
+            << "\"allows_at_least_two_resident_ctas_per_sm\":"
+            << (result.allows_at_least_two_resident_ctas_per_sm ? "true" : "false")
+            << ","
             << "\"spatial_coverage_fraction\":" << result.spatial_coverage_fraction << ","
             << "\"sparsity_test_dimension\":\"" << result.sparsity_test_dimension << "\","
             << "\"tensor_core_execution_path\":\"" << result.tensor_core_execution_path

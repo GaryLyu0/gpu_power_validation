@@ -23,6 +23,9 @@ struct WgmmaRunResult {
   int occupancy_max_active_blocks_per_sm = 0;
   int effective_blocks_per_sm_estimate = 0;
   bool occupancy_limited = false;
+  int registers_per_thread = 0;
+  std::size_t local_memory_bytes_per_thread = 0;
+  bool allows_at_least_two_resident_ctas_per_sm = false;
   bool correctness_smoke_passed = false;
   double correctness_reference = 16.0;
   double correctness_observed = 0.0;

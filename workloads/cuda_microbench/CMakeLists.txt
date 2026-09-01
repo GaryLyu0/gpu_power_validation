@@ -84,6 +84,7 @@ if(EXISTS "${CUTLASS_INCLUDE_DIR}/cute/tensor.hpp")
       tensor_core_wgmma_sm90a
       PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>
         $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_90a,code=sm_90a>
         $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_90a,code=compute_90a>
     )

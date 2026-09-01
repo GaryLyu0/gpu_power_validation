@@ -65,8 +65,25 @@ void check_cuda(cudaError_t status, const char* call) {
 
 template <int WaitGroup>
 CUTE_DEVICE void wait_for_wgmma() {
-  static_assert(WaitGroup == 0 || WaitGroup == 1, "Phase 1 supports wait groups 0 or 1");
+  static_assert(WaitGroup >= 0 && WaitGroup <= 3,
+                "Phase 2 supports wait groups from 0 through 3");
   warpgroup_wait<WaitGroup>();
+}
+
+template <int WaitGroup, class Mma, class FragmentA, class FragmentB, class Accumulator>
+CUTE_DEVICE void issue_wgmma_group(
+    Mma& mma,
+    FragmentA& fragment_a,
+    FragmentB& fragment_b,
+    Accumulator& accumulator) {
+  warpgroup_fence_operand(accumulator);
+  warpgroup_arrive();
+  cute::gemm(mma, fragment_a, fragment_b, accumulator);
+  warpgroup_commit_batch();
+  wait_for_wgmma<WaitGroup>();
+  if constexpr (WaitGroup == 0) {
+    warpgroup_fence_operand(accumulator);
+  }
 }
 
 template <int AccumulatorSets, int WaitGroup>
@@ -75,10 +92,10 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
     int ops_per_check,
     unsigned long long* cta_op_counts,
     float* cta_outputs) {
-  static_assert(AccumulatorSets == 1 || AccumulatorSets == 2,
-                "Phase 1 supports one or two accumulator sets");
-  static_assert(WaitGroup >= 0 && WaitGroup <= 1,
-                "Phase 1 supports wait groups 0 or 1");
+  static_assert(AccumulatorSets >= 1 && AccumulatorSets <= 4,
+                "Phase 2 supports one through four accumulator sets");
+  static_assert(WaitGroup >= 0 && WaitGroup <= 3,
+                "Phase 2 supports wait groups from 0 through 3");
   static_assert(WaitGroup < AccumulatorSets,
                 "The wait depth must be smaller than the accumulator-set count");
 
@@ -103,9 +120,17 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
   Tensor tCrB = thread_mma.make_fragment_B(tCsB);
   Tensor acc0 = partition_fragment_C(mma, Shape<_64, _64>{});
   Tensor acc1 = partition_fragment_C(mma, Shape<_64, _64>{});
+  Tensor acc2 = partition_fragment_C(mma, Shape<_64, _64>{});
+  Tensor acc3 = partition_fragment_C(mma, Shape<_64, _64>{});
   clear(acc0);
-  if constexpr (AccumulatorSets == 2) {
+  if constexpr (AccumulatorSets >= 2) {
     clear(acc1);
+  }
+  if constexpr (AccumulatorSets >= 3) {
+    clear(acc2);
+  }
+  if constexpr (AccumulatorSets >= 4) {
+    clear(acc3);
   }
 
   if (threadIdx.x == 0) {
@@ -116,39 +141,48 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
 
   unsigned long long completed_ops = 0;
   while (storage.continue_running != 0) {
-    for (int op = 0; op < ops_per_check; ++op) {
-      bool use_acc1 = AccumulatorSets == 2 && ((op & 1) != 0);
-      if (use_acc1) {
-        warpgroup_fence_operand(acc1);
-        warpgroup_arrive();
-        cute::gemm(mma, tCrA, tCrB, acc1);
-        warpgroup_commit_batch();
-        wait_for_wgmma<WaitGroup>();
-        if constexpr (WaitGroup == 0) {
-          warpgroup_fence_operand(acc1);
-        } else if (op > 0) {
-          // wait<1> completes the older group, which used the other accumulator.
-          warpgroup_fence_operand(acc0);
-        }
-      } else {
-        warpgroup_fence_operand(acc0);
-        warpgroup_arrive();
-        cute::gemm(mma, tCrA, tCrB, acc0);
-        warpgroup_commit_batch();
-        wait_for_wgmma<WaitGroup>();
-        if constexpr (WaitGroup == 0) {
-          warpgroup_fence_operand(acc0);
-        } else if (op > 0) {
-          // wait<1> completes the older group, which used the other accumulator.
-          warpgroup_fence_operand(acc1);
-        }
+    int operations_remaining = ops_per_check;
+    while (operations_remaining >= AccumulatorSets) {
+      // Explicit fragments keep accumulator selection compile-time specialized;
+      // no runtime-indexed accumulator array can spill into local memory.
+      // Since WaitGroup < AccumulatorSets, the prior group targeting an
+      // accumulator is complete before the next unrolled round reuses it.
+      issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc0);
+      if constexpr (AccumulatorSets >= 2) {
+        issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc1);
+      }
+      if constexpr (AccumulatorSets >= 3) {
+        issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc2);
+      }
+      if constexpr (AccumulatorSets >= 4) {
+        issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc3);
+      }
+      operations_remaining -= AccumulatorSets;
+    }
+    if (operations_remaining >= 1) {
+      issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc0);
+    }
+    if constexpr (AccumulatorSets >= 2) {
+      if (operations_remaining >= 2) {
+        issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc1);
+      }
+    }
+    if constexpr (AccumulatorSets >= 3) {
+      if (operations_remaining >= 3) {
+        issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc2);
       }
     }
 
     warpgroup_wait<0>();
     warpgroup_fence_operand(acc0);
-    if constexpr (AccumulatorSets == 2) {
+    if constexpr (AccumulatorSets >= 2) {
       warpgroup_fence_operand(acc1);
+    }
+    if constexpr (AccumulatorSets >= 3) {
+      warpgroup_fence_operand(acc2);
+    }
+    if constexpr (AccumulatorSets >= 4) {
+      warpgroup_fence_operand(acc3);
     }
     if (threadIdx.x == 0) {
       completed_ops += static_cast<unsigned long long>(ops_per_check);
@@ -161,8 +195,14 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
   if (threadIdx.x == 0) {
     cta_op_counts[blockIdx.x] = completed_ops;
     float output = acc0(0);
-    if constexpr (AccumulatorSets == 2) {
+    if constexpr (AccumulatorSets >= 2) {
       output += acc1(0);
+    }
+    if constexpr (AccumulatorSets >= 3) {
+      output += acc2(0);
+    }
+    if constexpr (AccumulatorSets >= 4) {
+      output += acc3(0);
     }
     cta_outputs[blockIdx.x] = output;
   }
@@ -202,31 +242,72 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_correctness_kernel(fl
   }
 }
 
+struct KernelResourceReport {
+  int occupancy_max_active_blocks_per_sm = 0;
+  int registers_per_thread = 0;
+  std::size_t local_memory_bytes_per_thread = 0;
+};
+
 template <int AccumulatorSets, int WaitGroup>
-int query_occupancy() {
-  int blocks_per_sm = 0;
+KernelResourceReport query_kernel_resources() {
+  KernelResourceReport report;
   check_cuda(
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &blocks_per_sm,
+          &report.occupancy_max_active_blocks_per_sm,
           wgmma_persistent_kernel<AccumulatorSets, WaitGroup>,
           kWarpgroupThreads,
           0),
       "cudaOccupancyMaxActiveBlocksPerMultiprocessor(wgmma_persistent)");
-  return blocks_per_sm;
+  cudaFuncAttributes attributes{};
+  check_cuda(
+      cudaFuncGetAttributes(
+          &attributes,
+          wgmma_persistent_kernel<AccumulatorSets, WaitGroup>),
+      "cudaFuncGetAttributes(wgmma_persistent)");
+  report.registers_per_thread = attributes.numRegs;
+  report.local_memory_bytes_per_thread = attributes.localSizeBytes;
+  return report;
 }
 
-int query_occupancy_dispatch(int accumulator_sets, int wait_group) {
-  if (accumulator_sets == 1 && wait_group == 0) {
-    return query_occupancy<1, 0>();
-  }
-  if (accumulator_sets == 2 && wait_group == 0) {
-    return query_occupancy<2, 0>();
-  }
-  if (accumulator_sets == 2 && wait_group == 1) {
-    return query_occupancy<2, 1>();
+template <int AccumulatorSets>
+KernelResourceReport query_wait_group_resources(int wait_group) {
+  switch (wait_group) {
+    case 0:
+      return query_kernel_resources<AccumulatorSets, 0>();
+    case 1:
+      if constexpr (AccumulatorSets >= 2) {
+        return query_kernel_resources<AccumulatorSets, 1>();
+      }
+      break;
+    case 2:
+      if constexpr (AccumulatorSets >= 3) {
+        return query_kernel_resources<AccumulatorSets, 2>();
+      }
+      break;
+    case 3:
+      if constexpr (AccumulatorSets >= 4) {
+        return query_kernel_resources<AccumulatorSets, 3>();
+      }
+      break;
   }
   throw std::runtime_error(
-      "wgmma_persistent requires wait_group < accumulator_sets; supported pairs are 1/0, 2/0, and 2/1");
+      "wgmma_persistent requires wait_group < accumulator_sets");
+}
+
+KernelResourceReport query_kernel_resources_dispatch(
+    int accumulator_sets,
+    int wait_group) {
+  switch (accumulator_sets) {
+    case 1:
+      return query_wait_group_resources<1>(wait_group);
+    case 2:
+      return query_wait_group_resources<2>(wait_group);
+    case 3:
+      return query_wait_group_resources<3>(wait_group);
+    case 4:
+      return query_wait_group_resources<4>(wait_group);
+  }
+  throw std::runtime_error("wgmma_persistent supports one through four accumulator sets");
 }
 
 template <int AccumulatorSets, int WaitGroup>
@@ -245,6 +326,45 @@ void launch_persistent(
   check_cuda(cudaGetLastError(), "wgmma_persistent_kernel");
 }
 
+template <int AccumulatorSets>
+void launch_wait_group_dispatch(
+    int wait_group,
+    int grid_blocks,
+    unsigned long long duration_cycles,
+    int ops_per_check,
+    unsigned long long* cta_op_counts,
+    float* cta_outputs) {
+  switch (wait_group) {
+    case 0:
+      launch_persistent<AccumulatorSets, 0>(
+          grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+      return;
+    case 1:
+      if constexpr (AccumulatorSets >= 2) {
+        launch_persistent<AccumulatorSets, 1>(
+            grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+        return;
+      }
+      break;
+    case 2:
+      if constexpr (AccumulatorSets >= 3) {
+        launch_persistent<AccumulatorSets, 2>(
+            grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+        return;
+      }
+      break;
+    case 3:
+      if constexpr (AccumulatorSets >= 4) {
+        launch_persistent<AccumulatorSets, 3>(
+            grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+        return;
+      }
+      break;
+  }
+  throw std::runtime_error(
+      "wgmma_persistent requires wait_group < accumulator_sets");
+}
+
 void launch_persistent_dispatch(
     int accumulator_sets,
     int wait_group,
@@ -253,23 +373,21 @@ void launch_persistent_dispatch(
     int ops_per_check,
     unsigned long long* cta_op_counts,
     float* cta_outputs) {
-  if (accumulator_sets == 1 && wait_group == 0) {
-    launch_persistent<1, 0>(
-        grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
-    return;
+  switch (accumulator_sets) {
+    case 1:
+      return launch_wait_group_dispatch<1>(
+          wait_group, grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+    case 2:
+      return launch_wait_group_dispatch<2>(
+          wait_group, grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+    case 3:
+      return launch_wait_group_dispatch<3>(
+          wait_group, grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
+    case 4:
+      return launch_wait_group_dispatch<4>(
+          wait_group, grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
   }
-  if (accumulator_sets == 2 && wait_group == 0) {
-    launch_persistent<2, 0>(
-        grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
-    return;
-  }
-  if (accumulator_sets == 2 && wait_group == 1) {
-    launch_persistent<2, 1>(
-        grid_blocks, duration_cycles, ops_per_check, cta_op_counts, cta_outputs);
-    return;
-  }
-  throw std::runtime_error(
-      "wgmma_persistent requires wait_group < accumulator_sets; supported pairs are 1/0, 2/0, and 2/1");
+  throw std::runtime_error("wgmma_persistent supports one through four accumulator sets");
 }
 
 double run_correctness_smoke() {
@@ -322,15 +440,22 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
   }
 
   const int grid_blocks = options.requested_sm_count * options.blocks_per_sm;
-  const int occupancy_max_active_blocks_per_sm =
-      query_occupancy_dispatch(options.accumulator_sets, options.wait_group);
+  const KernelResourceReport kernel_resources =
+      query_kernel_resources_dispatch(options.accumulator_sets, options.wait_group);
 
   WgmmaRunResult result;
   result.grid_blocks = grid_blocks;
-  result.occupancy_max_active_blocks_per_sm = occupancy_max_active_blocks_per_sm;
+  result.occupancy_max_active_blocks_per_sm =
+      kernel_resources.occupancy_max_active_blocks_per_sm;
   result.effective_blocks_per_sm_estimate =
-      std::min(options.blocks_per_sm, occupancy_max_active_blocks_per_sm);
-  result.occupancy_limited = options.blocks_per_sm > occupancy_max_active_blocks_per_sm;
+      std::min(options.blocks_per_sm, result.occupancy_max_active_blocks_per_sm);
+  result.occupancy_limited =
+      options.blocks_per_sm > result.occupancy_max_active_blocks_per_sm;
+  result.registers_per_thread = kernel_resources.registers_per_thread;
+  result.local_memory_bytes_per_thread =
+      kernel_resources.local_memory_bytes_per_thread;
+  result.allows_at_least_two_resident_ctas_per_sm =
+      result.occupancy_max_active_blocks_per_sm >= 2;
   result.correctness_observed = run_correctness_smoke();
   result.correctness_abs_error =
       std::abs(result.correctness_observed - result.correctness_reference);
