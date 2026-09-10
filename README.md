@@ -251,13 +251,23 @@ the device-wide PTX `%globaltimer` nanosecond timebase rather than converting
 seconds with an SM clock rate; JSON reports both requested and CUDA-event
 duration. The `2/1` accumulator/wait pair remains the Phase-1 baseline.
 
+The H100-only `--engine wgmma_control` path provides a matched persistent
+resident-control floor for the frozen WGMMA reference. It uses the same
+128-thread CTA and `requested_sm_count * blocks_per_sm` launch topology, but
+spends steady-state time in `__nanosleep()` with thread 0 checking
+`%globaltimer`. It executes no WGMMA/WMMA/MMA, TMA, operand streams, atomics, or
+arithmetic burn, and it intentionally does not reproduce WGMMA register or
+shared-memory resource use.
+
 On H100, CMake must print `Hopper WGMMA support: ON`; the dedicated WGMMA
 translation unit is compiled for `sm_90a` while other workloads retain
 `CUDA_ARCHITECTURES=90`:
 
 ```bash
 CUDA_ARCHITECTURES=90 bash scripts/build_workloads.sh
+./build/workloads/tensor_core_burn --device 1 --dtype bf16 --engine wgmma_control --active-sm-fraction 1.0 --blocks-per-sm 2 --control-sleep-ns 100000 --warmup-sec 3 --steady-sec 10
 ./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 0.1 --blocks-per-sm 1 --wgmma-instruction-n 64 --wgmma-ops-per-check 512 --wgmma-wait-group 1 --wgmma-accumulator-sets 2 --warmup-sec 1 --steady-sec 2
+cuobjdump --dump-sass --function wgmma_control_kernel_sm90a build/workloads/tensor_core_burn
 cuobjdump --dump-sass build/workloads/tensor_core_burn | grep -E 'HGMMA\.64x(64|128|256)x16\.F32\.BF16|WGMMA'
 cuobjdump --dump-ptx build/workloads/tensor_core_burn | grep -E 'wgmma\\.mma_async'
 ```

@@ -11,6 +11,7 @@
 #include <cusparseLt.h>
 #endif
 #if defined(HAVE_WGMMA_SM90A)
+#include "tensor_core_wgmma_control_sm90.hpp"
 #include "tensor_core_wgmma_sm90.hpp"
 #endif
 
@@ -59,6 +60,7 @@ struct Options {
   int wgmma_wait_group = 1;
   int wgmma_accumulator_sets = 2;
   int wgmma_instruction_n = 64;
+  int control_sleep_ns = 100000;
   std::string sparsity_mode = "none";
   double zero_ratio = 0.0;
   std::string zero_pattern = "regular_k";
@@ -85,9 +87,13 @@ struct Result {
   std::string timer_source = "";
   double requested_duration_ms = 0.0;
   std::string duty_control_mode;
+  std::string control_mode;
+  int control_sleep_ns = 0;
+  std::uint64_t control_wakeup_checks = 0;
   std::string spatial_control_mode;
   bool sm_count_target_applied = false;
   int grid_blocks = 0;
+  int block_size = 0;
   int blocks_per_sm = 0;
   int mma_iters_per_loop = 0;
   int accumulators_per_warp = 0;
@@ -101,6 +107,7 @@ struct Result {
   int occupancy_max_active_blocks_per_sm = 0;
   int effective_blocks_per_sm_estimate = 0;
   bool occupancy_limited = false;
+  bool blocks_per_sm_resource_feasible = false;
   int registers_per_thread = 0;
   std::uint64_t local_memory_bytes_per_thread = 0;
   bool allows_at_least_two_resident_ctas_per_sm = false;
@@ -156,6 +163,7 @@ struct Result {
   bool uses_cutlass_mma_atom_direct = false;
   int warpgroup_threads = 0;
   int warps_per_warpgroup = 0;
+  int warps_per_cta = 0;
   int wgmma_instruction_m = 0;
   int wgmma_instruction_n = 0;
   int wgmma_instruction_k = 0;
@@ -355,6 +363,8 @@ Options parse_args(int argc, char** argv) {
       options.wgmma_accumulator_sets = parse_int(require_value(arg), arg);
     } else if (arg == "--wgmma-instruction-n") {
       options.wgmma_instruction_n = parse_int(require_value(arg), arg);
+    } else if (arg == "--control-sleep-ns") {
+      options.control_sleep_ns = parse_int(require_value(arg), arg);
     } else if (arg == "--sparsity-mode") {
       options.sparsity_mode = require_value(arg);
     } else if (arg == "--zero-ratio") {
@@ -368,7 +378,7 @@ Options parse_args(int argc, char** argv) {
     } else if (arg == "--help") {
       std::cout
           << "Usage: tensor_core_burn --device 0 --dtype bf16 "
-          << "--engine cublas|cublas_strided_batched|wmma_persistent|cutlass_tile_burn|wgmma_persistent "
+          << "--engine cublas|cublas_strided_batched|wmma_persistent|cutlass_tile_burn|wgmma_persistent|wgmma_control "
           << "--m 8192 --n 8192 "
           << "--k 8192 --duty-cycle 1.0 --active-sm-fraction 1.0 "
           << "--period-ms 1000 --blocks-per-sm 1 "
@@ -379,6 +389,7 @@ Options parse_args(int argc, char** argv) {
           << "--synthetic-mma-ops-per-loop 256 "
           << "--wgmma-ops-per-check 512 --wgmma-wait-group 1 "
           << "--wgmma-accumulator-sets 2 --wgmma-instruction-n {64,128,256} "
+          << "--control-sleep-ns 100000 "
           << "--sparsity-mode none|dense_zero|structured_2to4 "
           << "--zero-ratio 0.0 --zero-pattern regular_k "
           << "--sparse-operand A --sparse-engine cusparselt "
@@ -410,6 +421,11 @@ Options parse_args(int argc, char** argv) {
           << "WGMMA duration checks use the device-wide PTX globaltimer "
           << "nanosecond timebase at coarse batch boundaries, independent of "
           << "SM clock DVFS.\n"
+          << "engine=wgmma_control is a Hopper persistent resident-control "
+          << "baseline. It launches the same requested 128-thread CTA topology, "
+          << "spends steady-state time in __nanosleep, and executes no WGMMA, "
+          << "tensor arithmetic, operand streams, TMA, or atomics. "
+          << "--control-sleep-ns must be in [1, 1000000].\n"
           << "sparsity-mode=dense_zero inserts zero values into dense cuBLAS operands "
           << "but does not use hardware sparse Tensor Cores.\n"
           << "sparsity-mode=structured_2to4 requires a real sparse backend such as "
@@ -425,9 +441,9 @@ Options parse_args(int argc, char** argv) {
   }
   if (options.engine != "cublas" && options.engine != "cublas_strided_batched" &&
       options.engine != "wmma_persistent" && options.engine != "cutlass_tile_burn" &&
-      options.engine != "wgmma_persistent") {
+      options.engine != "wgmma_persistent" && options.engine != "wgmma_control") {
     throw std::runtime_error(
-        "--engine must be cublas, cublas_strided_batched, wmma_persistent, cutlass_tile_burn, or wgmma_persistent");
+        "--engine must be cublas, cublas_strided_batched, wmma_persistent, cutlass_tile_burn, wgmma_persistent, or wgmma_control");
   }
   if (options.duty_cycle < 0.0 || options.duty_cycle > 1.0) {
     throw std::runtime_error("--duty-cycle must be in [0, 1]");
@@ -467,6 +483,9 @@ Options parse_args(int argc, char** argv) {
       options.wgmma_instruction_n != 256) {
     throw std::runtime_error("--wgmma-instruction-n must be one of: 64, 128, 256");
   }
+  if (options.control_sleep_ns <= 0 || options.control_sleep_ns > 1000000) {
+    throw std::runtime_error("--control-sleep-ns must be in [1, 1000000]");
+  }
   if (options.wgmma_wait_group >= options.wgmma_accumulator_sets) {
     throw std::runtime_error(
         "--wgmma-wait-group must be smaller than --wgmma-accumulator-sets");
@@ -501,6 +520,14 @@ Options parse_args(int argc, char** argv) {
     throw std::runtime_error(
         "wgmma_persistent phase 2 currently supports duty_cycle=1.0 only; "
         "warpgroup-uniform duty-cycle control will be implemented separately");
+  }
+  if (options.engine == "wgmma_control" && options.sparsity_mode != "none") {
+    throw std::runtime_error(
+        "engine=wgmma_control supports --sparsity-mode none only");
+  }
+  if (options.engine == "wgmma_control" && options.duty_cycle != 1.0) {
+    throw std::runtime_error(
+        "wgmma_control is a full-duration resident-control baseline and requires duty_cycle=1.0");
   }
   return options;
 }
@@ -2126,6 +2153,99 @@ Result measure_wgmma_persistent(const Options&, int) {
 }
 #endif
 
+#if defined(HAVE_WGMMA_SM90A)
+Result measure_wgmma_control(const Options& options, int requested_sm_count) {
+  gpu_power_validation::WgmmaControlRunOptions run_options;
+  run_options.device = options.device;
+  run_options.requested_sm_count = requested_sm_count;
+  run_options.blocks_per_sm = options.blocks_per_sm;
+  run_options.sleep_ns = static_cast<unsigned int>(options.control_sleep_ns);
+  run_options.warmup_sec = options.warmup_sec;
+  run_options.steady_sec = options.steady_sec;
+
+  const gpu_power_validation::WgmmaControlRunResult run_result =
+      gpu_power_validation::run_wgmma_control_sm90a(run_options);
+
+  Result result = make_base_result(options, requested_sm_count);
+  result.m = 0;
+  result.n = 0;
+  result.k = 0;
+  result.active_elapsed_ms = run_result.actual_elapsed_ms;
+  result.actual_elapsed_ms = run_result.actual_elapsed_ms;
+  result.timer_source = run_result.timer_source;
+  result.requested_duration_ms = run_result.requested_duration_ms;
+  result.measured_runtime_ms = run_result.actual_elapsed_ms;
+  result.iterations = 0;
+  result.active_tflops = 0.0;
+  result.scheduled_tflops = 0.0;
+  result.duty_control_mode = "persistent_resident_nanosleep";
+  result.control_mode = "persistent_resident_nanosleep";
+  result.control_sleep_ns = options.control_sleep_ns;
+  result.control_wakeup_checks = run_result.wakeup_checks;
+  result.spatial_control_mode = "persistent_cta_count";
+  result.grid_blocks = run_result.grid_blocks;
+  result.block_size = run_result.block_size;
+  result.blocks_per_sm = options.blocks_per_sm;
+  result.occupancy_max_active_blocks_per_sm =
+      run_result.occupancy_max_active_blocks_per_sm;
+  result.effective_blocks_per_sm_estimate =
+      run_result.effective_blocks_per_sm_estimate;
+  result.occupancy_limited = run_result.occupancy_limited;
+  result.blocks_per_sm_resource_feasible =
+      run_result.blocks_per_sm_resource_feasible;
+  result.registers_per_thread = run_result.registers_per_thread;
+  result.local_memory_bytes_per_thread =
+      static_cast<std::uint64_t>(run_result.local_memory_bytes_per_thread);
+  result.allows_at_least_two_resident_ctas_per_sm =
+      run_result.occupancy_max_active_blocks_per_sm >= 2;
+  if (!result.blocks_per_sm_resource_feasible) {
+    std::ostringstream warning;
+    warning << "Requested wgmma_control blocks_per_sm=" << options.blocks_per_sm
+            << " exceeds the CUDA occupancy limit of "
+            << result.occupancy_max_active_blocks_per_sm
+            << "; the launch grid is not silently clamped.";
+    result.warnings.push_back(warning.str());
+  }
+  if (result.local_memory_bytes_per_thread > 0) {
+    std::ostringstream warning;
+    warning << "wgmma_control reports " << result.local_memory_bytes_per_thread
+            << " local-memory byte(s) per thread; inspect ptxas before using the control baseline.";
+    result.warnings.push_back(warning.str());
+  }
+  result.gemm_semantics = "no_matrix_work_persistent_control";
+  result.expected_use_case =
+      "measures the resident CTA, warp, scheduler, timer, sleep, and synchronization control floor";
+  result.per_gemm_flops = 0.0;
+  result.total_flops_per_call = 0.0;
+  result.dense_equivalent_flops = 0.0;
+  result.matrix_shape_is_real = false;
+  result.synthetic_mnk_controls_mma_count = false;
+  result.memory_traffic_minimized = true;
+  result.uses_global_ab = "false";
+  result.uses_shared_memory_tiles = false;
+  result.tensor_core_execution_path = "none";
+  result.warpgroup_threads = 128;
+  result.warps_per_warpgroup = 4;
+  result.warps_per_cta = 4;
+  result.wgmma_ops_executed = 0;
+  result.wgmma_flops_per_op = 0.0;
+  result.uses_tma = false;
+  result.uses_tma_known = true;
+  result.initial_global_load_bytes = run_result.initial_global_load_bytes;
+  result.steady_global_load_bytes_per_loop =
+      run_result.steady_global_load_bytes_per_loop;
+  result.final_global_store_bytes = run_result.final_global_store_bytes;
+  result.note =
+      "wgmma_control is a persistent resident CTA/warp control floor. It uses one 128-thread CTA per requested block, PTX globaltimer duration checks by thread 0, __nanosleep between checks, and only a final wakeup-count store per CTA. It executes no WGMMA, WMMA, MMA, arithmetic burn, TMA, operand stream, atomics, or shared-memory A/B tile loop. It intentionally does not reproduce WGMMA register allocation or shared-memory activity. P_wgmma_full minus P_control represents incremental Tensor-compute-complex power including required WGMMA register-file, shared-memory, and control activity; it must not be called pure Tensor Core transistor power.";
+  return result;
+}
+#else
+Result measure_wgmma_control(const Options&, int) {
+  throw std::runtime_error(
+      "engine=wgmma_control requires an sm_90a-capable CUDA compiler; this binary was built without HAVE_WGMMA_SM90A");
+}
+#endif
+
 void print_json(const Result& result) {
   std::cout << "{"
             << "\"workload\":\"tensor_core_burn\","
@@ -2147,10 +2267,14 @@ void print_json(const Result& result) {
             << "\"timer_source\":\"" << result.timer_source << "\","
             << "\"requested_duration_ms\":" << result.requested_duration_ms << ","
             << "\"duty_control_mode\":\"" << result.duty_control_mode << "\","
+            << "\"control_mode\":\"" << result.control_mode << "\","
+            << "\"control_sleep_ns\":" << result.control_sleep_ns << ","
+            << "\"control_wakeup_checks\":" << result.control_wakeup_checks << ","
             << "\"spatial_control_mode\":\"" << result.spatial_control_mode << "\","
             << "\"sm_count_target_applied\":"
             << (result.sm_count_target_applied ? "true" : "false") << ","
             << "\"grid_blocks\":" << result.grid_blocks << ","
+            << "\"block_size\":" << result.block_size << ","
             << "\"blocks_per_sm\":" << result.blocks_per_sm << ","
             << "\"mma_iters_per_loop\":" << result.mma_iters_per_loop << ","
             << "\"accumulators_per_warp\":" << result.accumulators_per_warp << ","
@@ -2174,6 +2298,8 @@ void print_json(const Result& result) {
             << result.effective_blocks_per_sm_estimate << ","
             << "\"occupancy_limited\":"
             << (result.occupancy_limited ? "true" : "false") << ","
+            << "\"blocks_per_sm_resource_feasible\":"
+            << (result.blocks_per_sm_resource_feasible ? "true" : "false") << ","
             << "\"registers_per_thread\":" << result.registers_per_thread << ","
             << "\"local_memory_bytes_per_thread\":"
             << result.local_memory_bytes_per_thread << ","
@@ -2251,6 +2377,7 @@ void print_json(const Result& result) {
             << (result.uses_cutlass_mma_atom_direct ? "true" : "false") << ","
             << "\"warpgroup_threads\":" << result.warpgroup_threads << ","
             << "\"warps_per_warpgroup\":" << result.warps_per_warpgroup << ","
+            << "\"warps_per_cta\":" << result.warps_per_cta << ","
             << "\"wgmma_instruction_m\":" << result.wgmma_instruction_m << ","
             << "\"wgmma_instruction_n\":" << result.wgmma_instruction_n << ","
             << "\"wgmma_instruction_k\":" << result.wgmma_instruction_k << ","
@@ -2316,6 +2443,11 @@ int main(int argc, char** argv) {
     }
     if (options.engine == "wgmma_persistent") {
       Result result = measure_wgmma_persistent(options, requested_sm_count);
+      print_json(result);
+      return 0;
+    }
+    if (options.engine == "wgmma_control") {
+      Result result = measure_wgmma_control(options, requested_sm_count);
       print_json(result);
       return 0;
     }

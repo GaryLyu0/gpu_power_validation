@@ -67,7 +67,12 @@ if(EXISTS "${CUTLASS_INCLUDE_DIR}/cute/tensor.hpp")
     message(STATUS "Hopper WGMMA support: OFF (vendored CUTLASS lacks required SM90 GMMA headers)")
   endif()
   if(GPU_POWER_NVCC_SUPPORTS_SM90A)
-    add_library(tensor_core_wgmma_sm90a OBJECT tensor_core_wgmma_sm90.cu)
+    add_library(
+      tensor_core_wgmma_sm90a
+      OBJECT
+        tensor_core_wgmma_sm90.cu
+        tensor_core_wgmma_control_sm90.cu
+    )
     set_target_properties(
       tensor_core_wgmma_sm90a
       PROPERTIES
@@ -90,7 +95,7 @@ if(EXISTS "${CUTLASS_INCLUDE_DIR}/cute/tensor.hpp")
     )
     target_sources(tensor_core_burn PRIVATE $<TARGET_OBJECTS:tensor_core_wgmma_sm90a>)
     target_compile_definitions(tensor_core_burn PRIVATE HAVE_WGMMA_SM90A=1)
-    message(STATUS "Hopper WGMMA support: ON (tensor_core_wgmma_sm90.cu -> sm_90a + compute_90a)")
+    message(STATUS "Hopper WGMMA support: ON (WGMMA and control sources -> sm_90a + compute_90a)")
   elseif(EXISTS "${CUTLASS_SM90_GMMA_HEADER}" AND EXISTS "${CUTLASS_SM90_SMEM_HELPER}")
     message(STATUS "Hopper WGMMA support: OFF (NVIDIA CUDA compiler 12.0+ is required for sm_90a)")
   endif()

@@ -70,6 +70,10 @@ engines:
   forms one four-warp warpgroup and repeatedly issues asynchronous
   `64x{64,128,256}x16` BF16 x BF16 -> FP32 WGMMA operations selected by
   `--wgmma-instruction-n` from shared-memory-resident A/B tiles.
+- `--engine wgmma_control` is an H100-only persistent resident-control
+  baseline. It launches the same requested 128-thread CTA topology as
+  `wgmma_persistent`, but spends nearly all steady-state time in
+  `__nanosleep()` and executes no tensor instructions or operand streams.
 
 The WGMMA source is compiled separately for `sm_90a`; the existing targets keep
 their configured architecture list. CMake prints `Hopper WGMMA support: ON`
@@ -275,6 +279,76 @@ L2 traffic, global load/store traffic, shared-memory activity, register use,
 and occupancy. The intended result is higher sustained Hopper Tensor Core
 utilization without meaningful HBM or TMA traffic; that claim requires H100
 profiler and board-power measurements.
+
+### Hopper persistent-control baseline
+
+`wgmma_control` measures the power floor of the requested persistent CTA/warp
+topology without WGMMA or sustained memory work. It uses 128 threads per CTA,
+the same `requested_sm_count * blocks_per_sm` grid calculation as
+`wgmma_persistent`, `%globaltimer` for DVFS-independent requested duration, and
+`__nanosleep()` between thread-0 timer checks. `--control-sleep-ns` defaults to
+100000 and must be in `[1, 1000000]`; the timer, not the nominal sleep interval,
+determines termination.
+
+The control kernel does not allocate WGMMA A/B shared-memory tiles and does not
+attempt to reproduce WGMMA register pressure. It reports its actual register
+count, local-memory bytes, occupancy limit, and whether the requested
+`blocks_per_sm` is resource-feasible without silently clamping the grid. Its
+only global store is one wakeup/check count per CTA at exit.
+
+Use this baseline for attribution as follows:
+
+- `P_control - P_idle` approximates persistent CTA, warp, scheduler, timer,
+  sleep, and synchronization overhead.
+- `P_wgmma_full - P_control` approximates incremental Tensor-compute-complex
+  power, including required WGMMA register-file, shared-memory, and control
+  activity. It is not pure Tensor Core transistor power.
+
+Primary control and frozen full-compute reference:
+
+```bash
+./build/workloads/tensor_core_burn \
+  --device 1 --dtype bf16 --engine wgmma_control \
+  --active-sm-fraction 1.0 --blocks-per-sm 2 \
+  --control-sleep-ns 100000 \
+  --warmup-sec 3 --steady-sec 10
+
+./build/workloads/tensor_core_burn \
+  --device 1 --dtype bf16 --engine wgmma_persistent \
+  --m 64 --n 128 --k 16 \
+  --duty-cycle 1.0 --active-sm-fraction 1.0 --blocks-per-sm 2 \
+  --wgmma-instruction-n 128 --wgmma-ops-per-check 2048 \
+  --wgmma-accumulator-sets 2 --wgmma-wait-group 1 \
+  --warmup-sec 3 --steady-sec 10
+```
+
+Isolate and reject tensor instructions in the control kernel SASS, then verify
+the WGMMA reference separately:
+
+```bash
+cuobjdump --dump-sass --function wgmma_control_kernel_sm90a \
+  build/workloads/tensor_core_burn | tee build/wgmma_control.sass
+if grep -E 'HGMMA|WGMMA|HMMA|MMA' build/wgmma_control.sass; then
+  echo "ERROR: tensor instruction found in wgmma_control" >&2
+  exit 1
+fi
+
+cuobjdump --dump-sass build/workloads/tensor_core_burn |
+  grep -E 'HGMMA\.64x128x16\.F32\.BF16|WGMMA'
+```
+
+On the 132-SM H100, the primary control configuration should launch 264 CTAs.
+Validate approximately eight achieved active warps per SM, zero Tensor
+instructions, no spills, and negligible DRAM/L2 throughput with Nsight Compute
+before using its measured board power.
+
+```bash
+ncu --set full --target-processes all -o results/ncu_wgmma_control \
+  ./build/workloads/tensor_core_burn \
+  --device 1 --dtype bf16 --engine wgmma_control \
+  --active-sm-fraction 1.0 --blocks-per-sm 2 \
+  --control-sleep-ns 100000 --warmup-sec 1 --steady-sec 5
+```
 
 `cutlass_tile_burn` cap validation examples:
 
