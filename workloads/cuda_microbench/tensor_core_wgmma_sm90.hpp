@@ -10,6 +10,7 @@ struct WgmmaRunOptions {
   int device = 0;
   int requested_sm_count = 1;
   int blocks_per_sm = 1;
+  int instruction_n = 64;
   int ops_per_check = 512;
   int wait_group = 1;
   int accumulator_sets = 2;
@@ -19,6 +20,7 @@ struct WgmmaRunOptions {
 
 struct WgmmaRunResult {
   std::uint64_t wgmma_ops_executed = 0;
+  int instruction_n = 64;
   std::string timer_source = "ptx_globaltimer_ns";
   double requested_duration_ms = 0.0;
   double actual_elapsed_ms = 0.0;

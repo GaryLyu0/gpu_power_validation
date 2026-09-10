@@ -58,6 +58,7 @@ struct Options {
   int wgmma_ops_per_check = 512;
   int wgmma_wait_group = 1;
   int wgmma_accumulator_sets = 2;
+  int wgmma_instruction_n = 64;
   std::string sparsity_mode = "none";
   double zero_ratio = 0.0;
   std::string zero_pattern = "regular_k";
@@ -352,6 +353,8 @@ Options parse_args(int argc, char** argv) {
       options.wgmma_wait_group = parse_non_negative_int(require_value(arg), arg);
     } else if (arg == "--wgmma-accumulator-sets") {
       options.wgmma_accumulator_sets = parse_int(require_value(arg), arg);
+    } else if (arg == "--wgmma-instruction-n") {
+      options.wgmma_instruction_n = parse_int(require_value(arg), arg);
     } else if (arg == "--sparsity-mode") {
       options.sparsity_mode = require_value(arg);
     } else if (arg == "--zero-ratio") {
@@ -375,7 +378,7 @@ Options parse_args(int argc, char** argv) {
           << "--synthetic-m 8192 --synthetic-n 8192 --synthetic-k 8192 "
           << "--synthetic-mma-ops-per-loop 256 "
           << "--wgmma-ops-per-check 512 --wgmma-wait-group 1 "
-          << "--wgmma-accumulator-sets 2 "
+          << "--wgmma-accumulator-sets 2 --wgmma-instruction-n {64,128,256} "
           << "--sparsity-mode none|dense_zero|structured_2to4 "
           << "--zero-ratio 0.0 --zero-pattern regular_k "
           << "--sparse-operand A --sparse-engine cusparselt "
@@ -399,7 +402,8 @@ Options parse_args(int argc, char** argv) {
           << "SM90a WGMMA from A/B tiles initialized once in shared memory. "
           << "Phase 2 still requires --duty-cycle 1.0, uses no TMA, performs no "
           << "steady-state global A/B loads, and counts FLOPs from actual "
-          << "64x64x16 WGMMA operations. --wgmma-ops-per-check sets the "
+          << "64x{64,128,256}x16 WGMMA operations selected by "
+          << "--wgmma-instruction-n. --wgmma-ops-per-check sets the "
           << "coarse timer-check batch. Accumulator count is compile-time "
           << "specialized from 1 through 4; wait group supports 0 through 3 "
           << "and must be smaller than accumulator count.\n"
@@ -458,6 +462,10 @@ Options parse_args(int argc, char** argv) {
   }
   if (options.wgmma_accumulator_sets < 1 || options.wgmma_accumulator_sets > 4) {
     throw std::runtime_error("--wgmma-accumulator-sets must be in [1, 4]");
+  }
+  if (options.wgmma_instruction_n != 64 && options.wgmma_instruction_n != 128 &&
+      options.wgmma_instruction_n != 256) {
+    throw std::runtime_error("--wgmma-instruction-n must be one of: 64, 128, 256");
   }
   if (options.wgmma_wait_group >= options.wgmma_accumulator_sets) {
     throw std::runtime_error(
@@ -2014,6 +2022,7 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   run_options.device = options.device;
   run_options.requested_sm_count = requested_sm_count;
   run_options.blocks_per_sm = options.blocks_per_sm;
+  run_options.instruction_n = options.wgmma_instruction_n;
   run_options.ops_per_check = options.wgmma_ops_per_check;
   run_options.wait_group = options.wgmma_wait_group;
   run_options.accumulator_sets = options.wgmma_accumulator_sets;
@@ -2022,9 +2031,10 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
 
   const gpu_power_validation::WgmmaRunResult run_result =
       gpu_power_validation::run_wgmma_persistent_sm90a(run_options);
-  constexpr double kWgmmaFlopsPerOp = 2.0 * 64.0 * 64.0 * 16.0;
+  const double wgmma_flops_per_op =
+      2.0 * 64.0 * static_cast<double>(run_result.instruction_n) * 16.0;
   const double total_flops =
-      static_cast<double>(run_result.wgmma_ops_executed) * kWgmmaFlopsPerOp;
+      static_cast<double>(run_result.wgmma_ops_executed) * wgmma_flops_per_op;
 
   Result result = make_base_result(options, requested_sm_count);
   result.active_elapsed_ms = run_result.actual_elapsed_ms;
@@ -2084,15 +2094,17 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   result.warpgroup_threads = 128;
   result.warps_per_warpgroup = 4;
   result.wgmma_instruction_m = 64;
-  result.wgmma_instruction_n = 64;
+  result.wgmma_instruction_n = run_result.instruction_n;
   result.wgmma_instruction_k = 16;
   result.wgmma_ops_executed = run_result.wgmma_ops_executed;
-  result.wgmma_flops_per_op = kWgmmaFlopsPerOp;
+  result.wgmma_flops_per_op = wgmma_flops_per_op;
   result.wgmma_wait_group = options.wgmma_wait_group;
   result.wgmma_accumulator_sets = options.wgmma_accumulator_sets;
   result.wgmma_ops_per_check = options.wgmma_ops_per_check;
   result.wgmma_smem_operand_bytes_per_op =
-      (64ULL * 16ULL + 64ULL * 16ULL) * sizeof(__nv_bfloat16);
+      (64ULL * 16ULL +
+       static_cast<std::uint64_t>(run_result.instruction_n) * 16ULL) *
+      sizeof(__nv_bfloat16);
   result.uses_tma = false;
   result.uses_tma_known = true;
   result.initial_global_load_bytes = run_result.initial_global_load_bytes;
@@ -2104,7 +2116,7 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   result.correctness_observed = run_result.correctness_observed;
   result.correctness_abs_error = run_result.correctness_abs_error;
   result.note =
-      "wgmma_persistent phase 2 uses one 128-thread warpgroup per CTA, BF16 A/B tiles initialized once in shared memory, compile-time-specialized independent FP32 accumulators, no TMA, no steady-state global A/B loads, no hot-loop atomics, and a coarse warpgroup-uniform timer check. wait_group is always smaller than accumulator_sets so an accumulator is not reused while its prior WGMMA group can remain pending. Requested duration uses the device-wide PTX globaltimer nanosecond timebase after in-kernel shared-memory and descriptor setup; actual_elapsed_ms comes from CUDA events and conservatively includes that small one-time startup. m/n/k are retained only for CLI compatibility and do not determine executed work. blocks_per_sm is requested launch density; CUDA block scheduling approximates active-SM coverage and does not guarantee specific SM IDs.";
+      "wgmma_persistent phase 2 uses one 128-thread warpgroup per CTA, BF16 A/B tiles initialized once in shared memory, a compile-time-specialized instruction N dimension and independent FP32 accumulators, no TMA, no steady-state global A/B loads, no hot-loop atomics, and a coarse warpgroup-uniform timer check. wait_group is always smaller than accumulator_sets so an accumulator is not reused while its prior WGMMA group can remain pending. Requested duration uses the device-wide PTX globaltimer nanosecond timebase after in-kernel shared-memory and descriptor setup; actual_elapsed_ms comes from CUDA events and conservatively includes that small one-time startup. m/n/k are retained only for CLI compatibility and do not determine executed work. blocks_per_sm is requested launch density; CUDA block scheduling approximates active-SM coverage and does not guarantee specific SM IDs.";
   return result;
 }
 #else

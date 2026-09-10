@@ -68,8 +68,8 @@ engines:
   and does not use shared-memory A/B tiles.
 - `--engine wgmma_persistent` is an H100-only SM90a backend. One 128-thread CTA
   forms one four-warp warpgroup and repeatedly issues asynchronous
-  `64x64x16` BF16 x BF16 -> FP32 WGMMA operations from shared-memory-resident
-  A/B tiles.
+  `64x{64,128,256}x16` BF16 x BF16 -> FP32 WGMMA operations selected by
+  `--wgmma-instruction-n` from shared-memory-resident A/B tiles.
 
 The WGMMA source is compiled separately for `sm_90a`; the existing targets keep
 their configured architecture list. CMake prints `Hopper WGMMA support: ON`
@@ -102,7 +102,8 @@ Current Tensor Core limitations:
   and reuses them; the current version is register-constant atom burn.
 - For `wgmma_persistent`, `m`, `n`, and `k` are retained for CLI compatibility
   but do not determine executed work. TFLOPS are calculated from the completed
-  `64x64x16` WGMMA count. Phase 2 remains BF16-only and accepts only
+  WGMMA count and selected `64x{64,128,256}x16` instruction shape. Phase 2
+  remains BF16-only and accepts only
   `--duty-cycle 1.0`.
 - Validate actual spatial coverage and Tensor Core utilization with Nsight
   profiler metrics on the H100 server for both engines.
@@ -163,8 +164,9 @@ SM90a WGMMA and performs no TMA transfers, no global A/B loads, no global
 atomics, and no global stores. After draining all outstanding WGMMA groups, one
 counter and one accumulator sample per CTA are written to global memory.
 
-Phase 2 supports one through four compile-time-specialized accumulator sets and
-wait depths zero through three, with `wait_group < accumulator_sets`. Each
+Phase 2 supports compile-time-specialized instruction N values 64, 128, and 256,
+alongside one through four compile-time-specialized accumulator sets and wait
+depths zero through three, with `wait_group < accumulator_sets`. Each
 specialization has independent named FP32 fragments; there is no runtime-indexed
 accumulator array. The `2/1` configuration is the Phase-1 baseline. The primary
 new comparisons are `3/2` and `4/3`, plus shallower waits for diagnosing
@@ -186,10 +188,15 @@ stores can be checked at build time. `--active-sm-fraction` and
 `--blocks-per-sm` still control grid size, but CUDA scheduling only approximates
 SM coverage and does not select specific SM IDs.
 
+JSON also reports `wgmma_instruction_m/n/k`, `wgmma_flops_per_op`, and
+`wgmma_smem_operand_bytes_per_op`. For instruction N of 64, 128, and 256,
+FLOPs per operation are `2 * 64 * N * 16`, while logical shared-memory operand
+bytes per operation are `(64 * 16 + N * 16) * sizeof(bf16)`.
+
 Functional smoke on H100:
 
 ```bash
-./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 0.1 --blocks-per-sm 1 --wgmma-ops-per-check 512 --wgmma-wait-group 1 --wgmma-accumulator-sets 2 --sparsity-mode none --warmup-sec 1 --steady-sec 2
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 0.1 --blocks-per-sm 1 --wgmma-instruction-n 64 --wgmma-ops-per-check 512 --wgmma-wait-group 1 --wgmma-accumulator-sets 2 --sparsity-mode none --warmup-sec 1 --steady-sec 2
 ```
 
 Full-GPU and residency comparison:
@@ -219,6 +226,23 @@ for pair in "2 1" "3 1" "3 2" "4 1" "4 2" "4 3"; do
 done
 ```
 
+Instruction-shape exploration keeps the Phase-2 synchronization model fixed.
+The primary full-duty configurations are:
+
+```bash
+for config in "64 2 1" "128 1 0" "128 2 1" "256 1 0"; do
+  set -- ${config}
+  echo "=== instruction_n=$1 accumulators=$2 wait_group=$3 ==="
+  ./build/workloads/tensor_core_burn \
+    --device 0 --dtype bf16 --engine wgmma_persistent \
+    --m 64 --n "$1" --k 16 \
+    --duty-cycle 1.0 --active-sm-fraction 1.0 --blocks-per-sm 2 \
+    --wgmma-instruction-n "$1" --wgmma-ops-per-check 2048 \
+    --wgmma-accumulator-sets "$2" --wgmma-wait-group "$3" \
+    --sparsity-mode none --warmup-sec 5 --steady-sec 10
+done
+```
+
 For each result, require real HGMMA, inspect ptxas for zero spill loads/stores,
 check `local_memory_bytes_per_thread`, and confirm
 `occupancy_max_active_blocks_per_sm >= 2` before comparing TFLOPS or power.
@@ -227,12 +251,13 @@ Verify the generated code after the H100 build. The CMake target embeds both
 SM90a machine code and compute_90a PTX in the executable:
 
 ```bash
-cuobjdump --dump-sass build/workloads/tensor_core_burn | grep -E 'HGMMA|WGMMA'
+cuobjdump --dump-sass build/workloads/tensor_core_burn | grep -E 'HGMMA\.64x(64|128|256)x16\.F32\.BF16|WGMMA'
 cuobjdump --dump-ptx build/workloads/tensor_core_burn | grep -E 'wgmma\\.mma_async'
 ```
 
 Do not infer WGMMA execution from C++ type names alone. The first command should
-show Hopper `HGMMA` instructions and the second should show
+show `HGMMA.64x64x16.F32.BF16`, `HGMMA.64x128x16.F32.BF16`, and
+`HGMMA.64x256x16.F32.BF16` instructions and the second should show
 `wgmma.mma_async` PTX. Absence of both is a failed WGMMA build validation.
 
 Nsight Compute metric names vary by installed version. Discover available

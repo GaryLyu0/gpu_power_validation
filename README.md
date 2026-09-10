@@ -235,15 +235,17 @@ metrics on the H100 server.
 The experimental `--engine wgmma_persistent` path is different from both of
 those engines: it is an H100-only SM90a implementation with one 128-thread
 warpgroup per CTA. BF16 A/B tiles are initialized once in shared memory and
-reused by asynchronous `64x64x16` WGMMA operations. Phase 2 still supports only
+reused by asynchronous `64x{64,128,256}x16` WGMMA operations selected by
+`--wgmma-instruction-n`. Phase 2 still supports only
 `--duty-cycle 1.0`; it uses no TMA, performs no steady-state global A/B loads,
 and derives TFLOPS from the actual completed WGMMA count. The existing
 `cutlass_tile_burn` remains an SM80-style CuTe MMA atom burn, while
 `wmma_persistent` remains a 32-thread warp-level WMMA path.
 
 Phase 2 retains those workload boundaries and adds compile-time-specialized
-two-, three-, and four-accumulator ILP variants with WGMMA wait depths zero
-through three. The selected variant reports register count, local-memory bytes,
+instruction N and accumulator-count variants with WGMMA wait depths zero
+through three. The selected variant reports instruction M/N/K, FLOPs and
+shared-memory operand bytes per operation, register count, local-memory bytes,
 occupancy, and whether two CTAs per SM are expected to fit. Duration checks use
 the device-wide PTX `%globaltimer` nanosecond timebase rather than converting
 seconds with an SM clock rate; JSON reports both requested and CUDA-event
@@ -255,8 +257,8 @@ translation unit is compiled for `sm_90a` while other workloads retain
 
 ```bash
 CUDA_ARCHITECTURES=90 bash scripts/build_workloads.sh
-./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 0.1 --blocks-per-sm 1 --wgmma-ops-per-check 512 --wgmma-wait-group 1 --wgmma-accumulator-sets 2 --warmup-sec 1 --steady-sec 2
-cuobjdump --dump-sass build/workloads/tensor_core_burn | grep -E 'HGMMA|WGMMA'
+./build/workloads/tensor_core_burn --device 0 --dtype bf16 --engine wgmma_persistent --m 64 --n 64 --k 16 --duty-cycle 1.0 --active-sm-fraction 0.1 --blocks-per-sm 1 --wgmma-instruction-n 64 --wgmma-ops-per-check 512 --wgmma-wait-group 1 --wgmma-accumulator-sets 2 --warmup-sec 1 --steady-sec 2
+cuobjdump --dump-sass build/workloads/tensor_core_burn | grep -E 'HGMMA\.64x(64|128|256)x16\.F32\.BF16|WGMMA'
 cuobjdump --dump-ptx build/workloads/tensor_core_burn | grep -E 'wgmma\\.mma_async'
 ```
 

@@ -22,35 +22,66 @@ constexpr int kWarpgroupThreads = 128;
 
 using ElementA = cutlass::bfloat16_t;
 using ElementB = cutlass::bfloat16_t;
-using TileShape = Shape<_64, _64, _16>;
-using TiledMma = decltype(make_tiled_mma(
-    GMMA::ss_op_selector<
-        ElementA,
-        ElementB,
-        float,
-        TileShape,
-        GMMA::Major::K,
-        GMMA::Major::K>()));
-static_assert(decltype(size(TiledMma{}))::value == kWarpgroupThreads,
-              "The selected SM90 WGMMA atom must map to one 128-thread warpgroup");
+
+template <int InstructionN>
+struct WgmmaInstructionN;
+
+template <>
+struct WgmmaInstructionN<64> {
+  using Extent = _64;
+  using Atom = SM90_64x64x16_F32BF16BF16_SS<
+      GMMA::Major::K,
+      GMMA::Major::K>;
+};
+
+template <>
+struct WgmmaInstructionN<128> {
+  using Extent = _128;
+  using Atom = SM90_64x128x16_F32BF16BF16_SS<
+      GMMA::Major::K,
+      GMMA::Major::K>;
+};
+
+template <>
+struct WgmmaInstructionN<256> {
+  using Extent = _256;
+  using Atom = SM90_64x256x16_F32BF16BF16_SS<
+      GMMA::Major::K,
+      GMMA::Major::K>;
+};
+
+template <int InstructionN>
+using InstructionNType = typename WgmmaInstructionN<InstructionN>::Extent;
+
+template <int InstructionN>
+using WgmmaAtom = typename WgmmaInstructionN<InstructionN>::Atom;
+
+template <int InstructionN>
+using TiledMma = decltype(make_tiled_mma(WgmmaAtom<InstructionN>{}));
+
 using SmemLayoutAtomA = decltype(
     cutlass::gemm::collective::detail::ss_smem_selector<
         GMMA::Major::K,
         ElementA,
         _64,
         _16>());
+template <int InstructionN>
 using SmemLayoutAtomB = decltype(
     cutlass::gemm::collective::detail::ss_smem_selector<
         GMMA::Major::K,
         ElementB,
-        _64,
+        InstructionNType<InstructionN>,
         _16>());
 using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtomA{}, Shape<_64, _16>{}));
-using SmemLayoutB = decltype(tile_to_shape(SmemLayoutAtomB{}, Shape<_64, _16>{}));
+template <int InstructionN>
+using SmemLayoutB = decltype(tile_to_shape(
+    SmemLayoutAtomB<InstructionN>{},
+    Shape<InstructionNType<InstructionN>, _16>{}));
 
+template <int InstructionN>
 struct alignas(128) WgmmaSharedStorage {
   ArrayEngine<ElementA, cosize_v<SmemLayoutA>> a;
-  ArrayEngine<ElementB, cosize_v<SmemLayoutB>> b;
+  ArrayEngine<ElementB, cosize_v<SmemLayoutB<InstructionN>>> b;
   unsigned long long start_time_ns;
   int continue_running;
 };
@@ -92,7 +123,7 @@ CUTE_DEVICE void issue_wgmma_group(
   }
 }
 
-template <int AccumulatorSets, int WaitGroup>
+template <int InstructionN, int AccumulatorSets, int WaitGroup>
 __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
     unsigned long long duration_ns,
     int ops_per_check,
@@ -104,30 +135,35 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
                 "Phase 2 supports wait groups from 0 through 3");
   static_assert(WaitGroup < AccumulatorSets,
                 "The wait depth must be smaller than the accumulator-set count");
+  static_assert(decltype(size(TiledMma<InstructionN>{}))::value == kWarpgroupThreads,
+                "The selected SM90 WGMMA atom must map to one 128-thread warpgroup");
 
-  __shared__ WgmmaSharedStorage storage;
+  __shared__ WgmmaSharedStorage<InstructionN> storage;
 
   for (int index = threadIdx.x; index < cosize_v<SmemLayoutA>; index += blockDim.x) {
     storage.a.begin()[index] = ElementA(1.0f);
   }
-  for (int index = threadIdx.x; index < cosize_v<SmemLayoutB>; index += blockDim.x) {
+  for (int index = threadIdx.x; index < cosize_v<SmemLayoutB<InstructionN>>;
+       index += blockDim.x) {
     storage.b.begin()[index] = ElementB(1.0f);
   }
   __syncthreads();
 
   Tensor sA = make_tensor(make_smem_ptr(storage.a.begin()), SmemLayoutA{});
-  Tensor sB = make_tensor(make_smem_ptr(storage.b.begin()), SmemLayoutB{});
+  Tensor sB = make_tensor(
+      make_smem_ptr(storage.b.begin()), SmemLayoutB<InstructionN>{});
 
-  TiledMma mma;
+  TiledMma<InstructionN> mma;
   ThrMMA thread_mma = mma.get_slice(threadIdx.x);
   Tensor tCsA = thread_mma.partition_A(sA);
   Tensor tCsB = thread_mma.partition_B(sB);
   Tensor tCrA = thread_mma.make_fragment_A(tCsA);
   Tensor tCrB = thread_mma.make_fragment_B(tCsB);
-  Tensor acc0 = partition_fragment_C(mma, Shape<_64, _64>{});
-  Tensor acc1 = partition_fragment_C(mma, Shape<_64, _64>{});
-  Tensor acc2 = partition_fragment_C(mma, Shape<_64, _64>{});
-  Tensor acc3 = partition_fragment_C(mma, Shape<_64, _64>{});
+  using OutputShape = Shape<_64, InstructionNType<InstructionN>>;
+  Tensor acc0 = partition_fragment_C(mma, OutputShape{});
+  Tensor acc1 = partition_fragment_C(mma, OutputShape{});
+  Tensor acc2 = partition_fragment_C(mma, OutputShape{});
+  Tensor acc3 = partition_fragment_C(mma, OutputShape{});
   clear(acc0);
   if constexpr (AccumulatorSets >= 2) {
     clear(acc1);
@@ -214,26 +250,31 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
   }
 }
 
-template <int AccumulatorSets>
+template <int InstructionN>
 __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_correctness_kernel(float* output) {
-  __shared__ WgmmaSharedStorage storage;
+  static_assert(decltype(size(TiledMma<InstructionN>{}))::value == kWarpgroupThreads,
+                "The selected SM90 WGMMA atom must map to one 128-thread warpgroup");
+  __shared__ WgmmaSharedStorage<InstructionN> storage;
   for (int index = threadIdx.x; index < cosize_v<SmemLayoutA>; index += blockDim.x) {
     storage.a.begin()[index] = ElementA(1.0f);
   }
-  for (int index = threadIdx.x; index < cosize_v<SmemLayoutB>; index += blockDim.x) {
+  for (int index = threadIdx.x; index < cosize_v<SmemLayoutB<InstructionN>>;
+       index += blockDim.x) {
     storage.b.begin()[index] = ElementB(1.0f);
   }
   __syncthreads();
 
   Tensor sA = make_tensor(make_smem_ptr(storage.a.begin()), SmemLayoutA{});
-  Tensor sB = make_tensor(make_smem_ptr(storage.b.begin()), SmemLayoutB{});
-  TiledMma mma;
+  Tensor sB = make_tensor(
+      make_smem_ptr(storage.b.begin()), SmemLayoutB<InstructionN>{});
+  TiledMma<InstructionN> mma;
   ThrMMA thread_mma = mma.get_slice(threadIdx.x);
   Tensor tCsA = thread_mma.partition_A(sA);
   Tensor tCsB = thread_mma.partition_B(sB);
   Tensor tCrA = thread_mma.make_fragment_A(tCsA);
   Tensor tCrB = thread_mma.make_fragment_B(tCsB);
-  Tensor accumulator = partition_fragment_C(mma, Shape<_64, _64>{});
+  Tensor accumulator = partition_fragment_C(
+      mma, Shape<_64, InstructionNType<InstructionN>>{});
   clear(accumulator);
 
   warpgroup_fence_operand(accumulator);
@@ -254,13 +295,13 @@ struct KernelResourceReport {
   std::size_t local_memory_bytes_per_thread = 0;
 };
 
-template <int AccumulatorSets, int WaitGroup>
+template <int InstructionN, int AccumulatorSets, int WaitGroup>
 KernelResourceReport query_kernel_resources() {
   KernelResourceReport report;
   check_cuda(
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(
           &report.occupancy_max_active_blocks_per_sm,
-          wgmma_persistent_kernel<AccumulatorSets, WaitGroup>,
+          wgmma_persistent_kernel<InstructionN, AccumulatorSets, WaitGroup>,
           kWarpgroupThreads,
           0),
       "cudaOccupancyMaxActiveBlocksPerMultiprocessor(wgmma_persistent)");
@@ -268,31 +309,31 @@ KernelResourceReport query_kernel_resources() {
   check_cuda(
       cudaFuncGetAttributes(
           &attributes,
-          wgmma_persistent_kernel<AccumulatorSets, WaitGroup>),
+          wgmma_persistent_kernel<InstructionN, AccumulatorSets, WaitGroup>),
       "cudaFuncGetAttributes(wgmma_persistent)");
   report.registers_per_thread = attributes.numRegs;
   report.local_memory_bytes_per_thread = attributes.localSizeBytes;
   return report;
 }
 
-template <int AccumulatorSets>
+template <int InstructionN, int AccumulatorSets>
 KernelResourceReport query_wait_group_resources(int wait_group) {
   switch (wait_group) {
     case 0:
-      return query_kernel_resources<AccumulatorSets, 0>();
+      return query_kernel_resources<InstructionN, AccumulatorSets, 0>();
     case 1:
       if constexpr (AccumulatorSets >= 2) {
-        return query_kernel_resources<AccumulatorSets, 1>();
+        return query_kernel_resources<InstructionN, AccumulatorSets, 1>();
       }
       break;
     case 2:
       if constexpr (AccumulatorSets >= 3) {
-        return query_kernel_resources<AccumulatorSets, 2>();
+        return query_kernel_resources<InstructionN, AccumulatorSets, 2>();
       }
       break;
     case 3:
       if constexpr (AccumulatorSets >= 4) {
-        return query_kernel_resources<AccumulatorSets, 3>();
+        return query_kernel_resources<InstructionN, AccumulatorSets, 3>();
       }
       break;
   }
@@ -300,30 +341,46 @@ KernelResourceReport query_wait_group_resources(int wait_group) {
       "wgmma_persistent requires wait_group < accumulator_sets");
 }
 
-KernelResourceReport query_kernel_resources_dispatch(
+template <int InstructionN>
+KernelResourceReport query_accumulator_resources_dispatch(
     int accumulator_sets,
     int wait_group) {
   switch (accumulator_sets) {
     case 1:
-      return query_wait_group_resources<1>(wait_group);
+      return query_wait_group_resources<InstructionN, 1>(wait_group);
     case 2:
-      return query_wait_group_resources<2>(wait_group);
+      return query_wait_group_resources<InstructionN, 2>(wait_group);
     case 3:
-      return query_wait_group_resources<3>(wait_group);
+      return query_wait_group_resources<InstructionN, 3>(wait_group);
     case 4:
-      return query_wait_group_resources<4>(wait_group);
+      return query_wait_group_resources<InstructionN, 4>(wait_group);
   }
   throw std::runtime_error("wgmma_persistent supports one through four accumulator sets");
 }
 
-template <int AccumulatorSets, int WaitGroup>
+KernelResourceReport query_kernel_resources_dispatch(
+    int instruction_n,
+    int accumulator_sets,
+    int wait_group) {
+  switch (instruction_n) {
+    case 64:
+      return query_accumulator_resources_dispatch<64>(accumulator_sets, wait_group);
+    case 128:
+      return query_accumulator_resources_dispatch<128>(accumulator_sets, wait_group);
+    case 256:
+      return query_accumulator_resources_dispatch<256>(accumulator_sets, wait_group);
+  }
+  throw std::runtime_error("--wgmma-instruction-n must be one of: 64, 128, 256");
+}
+
+template <int InstructionN, int AccumulatorSets, int WaitGroup>
 void launch_persistent(
     int grid_blocks,
     unsigned long long duration_ns,
     int ops_per_check,
     unsigned long long* cta_op_counts,
     float* cta_outputs) {
-  wgmma_persistent_kernel<AccumulatorSets, WaitGroup>
+  wgmma_persistent_kernel<InstructionN, AccumulatorSets, WaitGroup>
       <<<grid_blocks, kWarpgroupThreads>>>(
           duration_ns,
           ops_per_check,
@@ -332,7 +389,7 @@ void launch_persistent(
   check_cuda(cudaGetLastError(), "wgmma_persistent_kernel");
 }
 
-template <int AccumulatorSets>
+template <int InstructionN, int AccumulatorSets>
 void launch_wait_group_dispatch(
     int wait_group,
     int grid_blocks,
@@ -342,26 +399,26 @@ void launch_wait_group_dispatch(
     float* cta_outputs) {
   switch (wait_group) {
     case 0:
-      launch_persistent<AccumulatorSets, 0>(
+      launch_persistent<InstructionN, AccumulatorSets, 0>(
           grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
       return;
     case 1:
       if constexpr (AccumulatorSets >= 2) {
-        launch_persistent<AccumulatorSets, 1>(
+        launch_persistent<InstructionN, AccumulatorSets, 1>(
             grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
         return;
       }
       break;
     case 2:
       if constexpr (AccumulatorSets >= 3) {
-        launch_persistent<AccumulatorSets, 2>(
+        launch_persistent<InstructionN, AccumulatorSets, 2>(
             grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
         return;
       }
       break;
     case 3:
       if constexpr (AccumulatorSets >= 4) {
-        launch_persistent<AccumulatorSets, 3>(
+        launch_persistent<InstructionN, AccumulatorSets, 3>(
             grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
         return;
       }
@@ -371,7 +428,8 @@ void launch_wait_group_dispatch(
       "wgmma_persistent requires wait_group < accumulator_sets");
 }
 
-void launch_persistent_dispatch(
+template <int InstructionN>
+void launch_accumulator_dispatch(
     int accumulator_sets,
     int wait_group,
     int grid_blocks,
@@ -381,28 +439,71 @@ void launch_persistent_dispatch(
     float* cta_outputs) {
   switch (accumulator_sets) {
     case 1:
-      return launch_wait_group_dispatch<1>(
+      return launch_wait_group_dispatch<InstructionN, 1>(
           wait_group, grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
     case 2:
-      return launch_wait_group_dispatch<2>(
+      return launch_wait_group_dispatch<InstructionN, 2>(
           wait_group, grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
     case 3:
-      return launch_wait_group_dispatch<3>(
+      return launch_wait_group_dispatch<InstructionN, 3>(
           wait_group, grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
     case 4:
-      return launch_wait_group_dispatch<4>(
+      return launch_wait_group_dispatch<InstructionN, 4>(
           wait_group, grid_blocks, duration_ns, ops_per_check, cta_op_counts, cta_outputs);
   }
   throw std::runtime_error("wgmma_persistent supports one through four accumulator sets");
 }
 
-double run_correctness_smoke() {
+void launch_persistent_dispatch(
+    int instruction_n,
+    int accumulator_sets,
+    int wait_group,
+    int grid_blocks,
+    unsigned long long duration_ns,
+    int ops_per_check,
+    unsigned long long* cta_op_counts,
+    float* cta_outputs) {
+  switch (instruction_n) {
+    case 64:
+      return launch_accumulator_dispatch<64>(
+          accumulator_sets, wait_group, grid_blocks, duration_ns, ops_per_check,
+          cta_op_counts, cta_outputs);
+    case 128:
+      return launch_accumulator_dispatch<128>(
+          accumulator_sets, wait_group, grid_blocks, duration_ns, ops_per_check,
+          cta_op_counts, cta_outputs);
+    case 256:
+      return launch_accumulator_dispatch<256>(
+          accumulator_sets, wait_group, grid_blocks, duration_ns, ops_per_check,
+          cta_op_counts, cta_outputs);
+  }
+  throw std::runtime_error("--wgmma-instruction-n must be one of: 64, 128, 256");
+}
+
+template <int InstructionN>
+void launch_correctness_kernel(float* device_output) {
+  wgmma_correctness_kernel<InstructionN><<<1, kWarpgroupThreads>>>(device_output);
+}
+
+double run_correctness_smoke(int instruction_n) {
   float* device_output = nullptr;
   float host_output = 0.0f;
   check_cuda(cudaMalloc(reinterpret_cast<void**>(&device_output), sizeof(float)),
              "cudaMalloc(wgmma correctness output)");
   try {
-    wgmma_correctness_kernel<1><<<1, kWarpgroupThreads>>>(device_output);
+    switch (instruction_n) {
+      case 64:
+        launch_correctness_kernel<64>(device_output);
+        break;
+      case 128:
+        launch_correctness_kernel<128>(device_output);
+        break;
+      case 256:
+        launch_correctness_kernel<256>(device_output);
+        break;
+      default:
+        throw std::runtime_error("--wgmma-instruction-n must be one of: 64, 128, 256");
+    }
     check_cuda(cudaGetLastError(), "wgmma_correctness_kernel");
     check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(wgmma correctness)");
     check_cuda(cudaMemcpy(
@@ -440,12 +541,18 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
   if (options.ops_per_check <= 0) {
     throw std::runtime_error("--wgmma-ops-per-check must be > 0");
   }
+  if (options.instruction_n != 64 && options.instruction_n != 128 &&
+      options.instruction_n != 256) {
+    throw std::runtime_error("--wgmma-instruction-n must be one of: 64, 128, 256");
+  }
 
   const int grid_blocks = options.requested_sm_count * options.blocks_per_sm;
   const KernelResourceReport kernel_resources =
-      query_kernel_resources_dispatch(options.accumulator_sets, options.wait_group);
+      query_kernel_resources_dispatch(
+          options.instruction_n, options.accumulator_sets, options.wait_group);
 
   WgmmaRunResult result;
+  result.instruction_n = options.instruction_n;
   result.requested_duration_ms = options.steady_sec * 1000.0;
   result.grid_blocks = grid_blocks;
   result.occupancy_max_active_blocks_per_sm =
@@ -459,7 +566,7 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
       kernel_resources.local_memory_bytes_per_thread;
   result.allows_at_least_two_resident_ctas_per_sm =
       result.occupancy_max_active_blocks_per_sm >= 2;
-  result.correctness_observed = run_correctness_smoke();
+  result.correctness_observed = run_correctness_smoke(options.instruction_n);
   result.correctness_abs_error =
       std::abs(result.correctness_observed - result.correctness_reference);
   result.correctness_smoke_passed = result.correctness_abs_error <= 0.1;
@@ -483,6 +590,7 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
   try {
     if (options.warmup_sec > 0.0) {
       launch_persistent_dispatch(
+          options.instruction_n,
           options.accumulator_sets,
           options.wait_group,
           grid_blocks,
@@ -499,6 +607,7 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
     check_cuda(cudaEventCreate(&stop), "cudaEventCreate(wgmma stop)");
     check_cuda(cudaEventRecord(start), "cudaEventRecord(wgmma start)");
     launch_persistent_dispatch(
+        options.instruction_n,
         options.accumulator_sets,
         options.wait_group,
         grid_blocks,
