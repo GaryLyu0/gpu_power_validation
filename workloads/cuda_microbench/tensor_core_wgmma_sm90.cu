@@ -325,17 +325,16 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_duty_persistent_kerne
     if (threadIdx.x == 0) {
       const unsigned long long now_ns = read_globaltimer_ns();
       storage.continue_running = now_ns < storage.end_time_ns ? 1 : 0;
+      const unsigned long long phase_ns = now_ns % period_ns;
       storage.active_phase =
-          active_window_ns > 0 && (now_ns % period_ns) < active_window_ns ? 1 : 0;
+          active_window_ns > 0 && phase_ns < active_window_ns ? 1 : 0;
       storage.segment_start_ns = now_ns;
-      if (storage.active_phase == 0) {
-        const unsigned long long phase_ns = now_ns % period_ns;
-        const unsigned long long next_phase_ns =
-            now_ns + (period_ns - phase_ns);
-        storage.phase_deadline_ns = next_phase_ns < storage.end_time_ns
-                                        ? next_phase_ns
-                                        : storage.end_time_ns;
-      }
+      const unsigned long long next_phase_ns = storage.active_phase != 0
+                                                    ? now_ns + active_window_ns - phase_ns
+                                                    : now_ns + period_ns - phase_ns;
+      storage.phase_deadline_ns = next_phase_ns < storage.end_time_ns
+                                      ? next_phase_ns
+                                      : storage.end_time_ns;
     }
     __syncthreads();
 
@@ -344,26 +343,37 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_duty_persistent_kerne
     }
 
     if (storage.active_phase != 0) {
-      int operations_remaining = duty_check_ops;
-      while (operations_remaining >= AccumulatorSets) {
-        // This is the same N128/2-accumulator/wait1 issue primitive as the
-        // validated full-duty path; only the chunk boundary adds timing control.
-        issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc0);
-        issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc1);
-        operations_remaining -= AccumulatorSets;
-      }
-      if (operations_remaining >= 1) {
-        issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc0);
-      }
+      do {
+        int operations_remaining = duty_check_ops;
+        while (operations_remaining >= AccumulatorSets) {
+          // This is the same N128/2-accumulator/wait1 issue primitive as the
+          // validated full-duty path; only the chunk boundary adds timing control.
+          issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc0);
+          issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc1);
+          operations_remaining -= AccumulatorSets;
+        }
 
-      // Fully drain asynchronous WGMMA work before the next phase decision.
-      // Consequently an idle phase never begins while Tensor work is pending.
+        if (threadIdx.x == 0) {
+          const unsigned long long now_ns = read_globaltimer_ns();
+          completed_ops += static_cast<unsigned long long>(duty_check_ops);
+          storage.measured_active_ns += now_ns - storage.segment_start_ns;
+          storage.segment_start_ns = now_ns;
+          storage.continue_running = now_ns < storage.end_time_ns ? 1 : 0;
+          storage.active_phase =
+              storage.continue_running != 0 && now_ns < storage.phase_deadline_ns
+                  ? 1
+                  : 0;
+        }
+        __syncthreads();
+      } while (storage.active_phase != 0);
+
+      // Timer checks preserve the wait1/two-accumulator pipeline. Fully drain
+      // only after the active boundary or kernel end has actually arrived.
       warpgroup_wait<0>();
       warpgroup_fence_operand(acc0);
       warpgroup_fence_operand(acc1);
       if (threadIdx.x == 0) {
         const unsigned long long now_ns = read_globaltimer_ns();
-        completed_ops += static_cast<unsigned long long>(duty_check_ops);
         storage.measured_active_ns += now_ns - storage.segment_start_ns;
         storage.continue_running = now_ns < storage.end_time_ns ? 1 : 0;
       }
@@ -378,8 +388,22 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_duty_persistent_kerne
         const unsigned long long now_ns = read_globaltimer_ns();
         if (now_ns < storage.phase_deadline_ns) {
           const unsigned long long remaining_ns = storage.phase_deadline_ns - now_ns;
-          storage.sleep_ns = static_cast<unsigned int>(
-              remaining_ns < 1000000ULL ? remaining_ns : 1000000ULL);
+          unsigned long long sleep_ns = 0;
+          if (remaining_ns > 20000ULL) {
+            sleep_ns = remaining_ns / 2ULL < 10000ULL
+                           ? remaining_ns / 2ULL
+                           : 10000ULL;
+          } else if (remaining_ns > 2000ULL) {
+            sleep_ns = remaining_ns / 2ULL < 1000ULL
+                           ? remaining_ns / 2ULL
+                           : 1000ULL;
+          } else {
+            sleep_ns = remaining_ns / 2ULL;
+            if (sleep_ns == 0) {
+              sleep_ns = 1;
+            }
+          }
+          storage.sleep_ns = static_cast<unsigned int>(sleep_ns);
           storage.should_sleep = 1;
         } else {
           storage.should_sleep = 0;
@@ -764,6 +788,12 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
         "WGMMA temporal duty control currently requires the validated "
         "--wgmma-instruction-n 128 --wgmma-accumulator-sets 2 "
         "--wgmma-wait-group 1 configuration");
+  }
+  if (!full_duty && options.duty_cycle > 0.0 &&
+      options.duty_check_ops % 2 != 0) {
+    throw std::runtime_error(
+        "--wgmma-duty-check-ops must be even for the validated two-accumulator "
+        "pipeline so accumulator rotation remains legal across active chunks");
   }
   const KernelResourceReport kernel_resources = full_duty
                                                     ? query_kernel_resources_dispatch(
