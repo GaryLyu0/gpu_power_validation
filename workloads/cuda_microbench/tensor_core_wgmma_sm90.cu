@@ -86,6 +86,22 @@ struct alignas(128) WgmmaSharedStorage {
   int continue_running;
 };
 
+template <int InstructionN>
+struct alignas(128) WgmmaDutySharedStorage {
+  ArrayEngine<ElementA, cosize_v<SmemLayoutA>> a;
+  ArrayEngine<ElementB, cosize_v<SmemLayoutB<InstructionN>>> b;
+  unsigned long long start_time_ns;
+  unsigned long long end_time_ns;
+  unsigned long long segment_start_ns;
+  unsigned long long phase_deadline_ns;
+  unsigned long long measured_active_ns;
+  unsigned long long measured_idle_ns;
+  unsigned int sleep_ns;
+  int continue_running;
+  int active_phase;
+  int should_sleep;
+};
+
 void check_cuda(cudaError_t status, const char* call) {
   if (status != cudaSuccess) {
     std::ostringstream message;
@@ -250,6 +266,148 @@ __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_persistent_kernel(
   }
 }
 
+template <int InstructionN, int AccumulatorSets, int WaitGroup>
+__global__ __launch_bounds__(kWarpgroupThreads) void wgmma_duty_persistent_kernel(
+    unsigned long long duration_ns,
+    unsigned long long period_ns,
+    unsigned long long active_window_ns,
+    int duty_check_ops,
+    unsigned long long* cta_op_counts,
+    float* cta_outputs,
+    unsigned long long* cta_active_ns,
+    unsigned long long* cta_idle_ns) {
+  static_assert(InstructionN == 128,
+                "Temporal duty control is frozen to the validated N128 WGMMA atom");
+  static_assert(AccumulatorSets == 2,
+                "Temporal duty control is frozen to two accumulator sets");
+  static_assert(WaitGroup == 1,
+                "Temporal duty control is frozen to wait_group=1");
+  static_assert(decltype(size(TiledMma<InstructionN>{}))::value == kWarpgroupThreads,
+                "The selected SM90 WGMMA atom must map to one 128-thread warpgroup");
+
+  __shared__ WgmmaDutySharedStorage<InstructionN> storage;
+
+  for (int index = threadIdx.x; index < cosize_v<SmemLayoutA>; index += blockDim.x) {
+    storage.a.begin()[index] = ElementA(1.0f);
+  }
+  for (int index = threadIdx.x; index < cosize_v<SmemLayoutB<InstructionN>>;
+       index += blockDim.x) {
+    storage.b.begin()[index] = ElementB(1.0f);
+  }
+  __syncthreads();
+
+  Tensor sA = make_tensor(make_smem_ptr(storage.a.begin()), SmemLayoutA{});
+  Tensor sB = make_tensor(
+      make_smem_ptr(storage.b.begin()), SmemLayoutB<InstructionN>{});
+  TiledMma<InstructionN> mma;
+  ThrMMA thread_mma = mma.get_slice(threadIdx.x);
+  Tensor tCsA = thread_mma.partition_A(sA);
+  Tensor tCsB = thread_mma.partition_B(sB);
+  Tensor tCrA = thread_mma.make_fragment_A(tCsA);
+  Tensor tCrB = thread_mma.make_fragment_B(tCsB);
+  using OutputShape = Shape<_64, InstructionNType<InstructionN>>;
+  Tensor acc0 = partition_fragment_C(mma, OutputShape{});
+  Tensor acc1 = partition_fragment_C(mma, OutputShape{});
+  clear(acc0);
+  clear(acc1);
+
+  if (threadIdx.x == 0) {
+    storage.start_time_ns = read_globaltimer_ns();
+    storage.end_time_ns = storage.start_time_ns + duration_ns;
+    storage.measured_active_ns = 0;
+    storage.measured_idle_ns = 0;
+    storage.continue_running = 1;
+  }
+  __syncthreads();
+
+  unsigned long long completed_ops = 0;
+  while (storage.continue_running != 0) {
+    if (threadIdx.x == 0) {
+      const unsigned long long now_ns = read_globaltimer_ns();
+      storage.continue_running = now_ns < storage.end_time_ns ? 1 : 0;
+      storage.active_phase =
+          active_window_ns > 0 && (now_ns % period_ns) < active_window_ns ? 1 : 0;
+      storage.segment_start_ns = now_ns;
+      if (storage.active_phase == 0) {
+        const unsigned long long phase_ns = now_ns % period_ns;
+        const unsigned long long next_phase_ns =
+            now_ns + (period_ns - phase_ns);
+        storage.phase_deadline_ns = next_phase_ns < storage.end_time_ns
+                                        ? next_phase_ns
+                                        : storage.end_time_ns;
+      }
+    }
+    __syncthreads();
+
+    if (storage.continue_running == 0) {
+      break;
+    }
+
+    if (storage.active_phase != 0) {
+      int operations_remaining = duty_check_ops;
+      while (operations_remaining >= AccumulatorSets) {
+        // This is the same N128/2-accumulator/wait1 issue primitive as the
+        // validated full-duty path; only the chunk boundary adds timing control.
+        issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc0);
+        issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc1);
+        operations_remaining -= AccumulatorSets;
+      }
+      if (operations_remaining >= 1) {
+        issue_wgmma_group<WaitGroup>(mma, tCrA, tCrB, acc0);
+      }
+
+      // Fully drain asynchronous WGMMA work before the next phase decision.
+      // Consequently an idle phase never begins while Tensor work is pending.
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(acc0);
+      warpgroup_fence_operand(acc1);
+      if (threadIdx.x == 0) {
+        const unsigned long long now_ns = read_globaltimer_ns();
+        completed_ops += static_cast<unsigned long long>(duty_check_ops);
+        storage.measured_active_ns += now_ns - storage.segment_start_ns;
+        storage.continue_running = now_ns < storage.end_time_ns ? 1 : 0;
+      }
+      __syncthreads();
+      continue;
+    }
+
+    // All lanes sleep together in bounded chunks. The device-wide globaltimer,
+    // rather than the nominal nanosleep duration, determines the phase boundary.
+    while (true) {
+      if (threadIdx.x == 0) {
+        const unsigned long long now_ns = read_globaltimer_ns();
+        if (now_ns < storage.phase_deadline_ns) {
+          const unsigned long long remaining_ns = storage.phase_deadline_ns - now_ns;
+          storage.sleep_ns = static_cast<unsigned int>(
+              remaining_ns < 1000000ULL ? remaining_ns : 1000000ULL);
+          storage.should_sleep = 1;
+        } else {
+          storage.should_sleep = 0;
+        }
+      }
+      __syncthreads();
+      if (storage.should_sleep == 0) {
+        break;
+      }
+      __nanosleep(storage.sleep_ns);
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      const unsigned long long now_ns = read_globaltimer_ns();
+      storage.measured_idle_ns += now_ns - storage.segment_start_ns;
+      storage.continue_running = now_ns < storage.end_time_ns ? 1 : 0;
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    cta_op_counts[blockIdx.x] = completed_ops;
+    cta_active_ns[blockIdx.x] = storage.measured_active_ns;
+    cta_idle_ns[blockIdx.x] = storage.measured_idle_ns;
+    cta_outputs[blockIdx.x] = acc0(0) + acc1(0);
+  }
+}
+
 template <int InstructionN>
 __global__ __launch_bounds__(kWarpgroupThreads) void wgmma_correctness_kernel(float* output) {
   static_assert(decltype(size(TiledMma<InstructionN>{}))::value == kWarpgroupThreads,
@@ -373,6 +531,26 @@ KernelResourceReport query_kernel_resources_dispatch(
   throw std::runtime_error("--wgmma-instruction-n must be one of: 64, 128, 256");
 }
 
+KernelResourceReport query_duty_kernel_resources() {
+  KernelResourceReport report;
+  check_cuda(
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &report.occupancy_max_active_blocks_per_sm,
+          wgmma_duty_persistent_kernel<128, 2, 1>,
+          kWarpgroupThreads,
+          0),
+      "cudaOccupancyMaxActiveBlocksPerMultiprocessor(wgmma duty persistent)");
+  cudaFuncAttributes attributes{};
+  check_cuda(
+      cudaFuncGetAttributes(
+          &attributes,
+          wgmma_duty_persistent_kernel<128, 2, 1>),
+      "cudaFuncGetAttributes(wgmma duty persistent)");
+  report.registers_per_thread = attributes.numRegs;
+  report.local_memory_bytes_per_thread = attributes.localSizeBytes;
+  return report;
+}
+
 template <int InstructionN, int AccumulatorSets, int WaitGroup>
 void launch_persistent(
     int grid_blocks,
@@ -480,6 +658,28 @@ void launch_persistent_dispatch(
   throw std::runtime_error("--wgmma-instruction-n must be one of: 64, 128, 256");
 }
 
+void launch_duty_persistent(
+    int grid_blocks,
+    unsigned long long duration_ns,
+    unsigned long long period_ns,
+    unsigned long long active_window_ns,
+    int duty_check_ops,
+    unsigned long long* cta_op_counts,
+    float* cta_outputs,
+    unsigned long long* cta_active_ns,
+    unsigned long long* cta_idle_ns) {
+  wgmma_duty_persistent_kernel<128, 2, 1><<<grid_blocks, kWarpgroupThreads>>>(
+      duration_ns,
+      period_ns,
+      active_window_ns,
+      duty_check_ops,
+      cta_op_counts,
+      cta_outputs,
+      cta_active_ns,
+      cta_idle_ns);
+  check_cuda(cudaGetLastError(), "wgmma_duty_persistent_kernel");
+}
+
 template <int InstructionN>
 void launch_correctness_kernel(float* device_output) {
   wgmma_correctness_kernel<InstructionN><<<1, kWarpgroupThreads>>>(device_output);
@@ -541,18 +741,53 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
   if (options.ops_per_check <= 0) {
     throw std::runtime_error("--wgmma-ops-per-check must be > 0");
   }
+  if (options.duty_cycle < 0.0 || options.duty_cycle > 1.0) {
+    throw std::runtime_error("--duty-cycle must be in [0, 1]");
+  }
+  if (options.duty_period_ns == 0) {
+    throw std::runtime_error("--wgmma-duty-period-ns must be > 0");
+  }
+  if (options.duty_check_ops <= 0) {
+    throw std::runtime_error("--wgmma-duty-check-ops must be > 0");
+  }
   if (options.instruction_n != 64 && options.instruction_n != 128 &&
       options.instruction_n != 256) {
     throw std::runtime_error("--wgmma-instruction-n must be one of: 64, 128, 256");
   }
 
   const int grid_blocks = options.requested_sm_count * options.blocks_per_sm;
-  const KernelResourceReport kernel_resources =
-      query_kernel_resources_dispatch(
-          options.instruction_n, options.accumulator_sets, options.wait_group);
+  const bool full_duty = options.duty_cycle == 1.0;
+  if (!full_duty &&
+      (options.instruction_n != 128 || options.accumulator_sets != 2 ||
+       options.wait_group != 1)) {
+    throw std::runtime_error(
+        "WGMMA temporal duty control currently requires the validated "
+        "--wgmma-instruction-n 128 --wgmma-accumulator-sets 2 "
+        "--wgmma-wait-group 1 configuration");
+  }
+  const KernelResourceReport kernel_resources = full_duty
+                                                    ? query_kernel_resources_dispatch(
+                                                          options.instruction_n,
+                                                          options.accumulator_sets,
+                                                          options.wait_group)
+                                                    : query_duty_kernel_resources();
+
+  unsigned long long requested_active_window_ns = static_cast<unsigned long long>(
+      std::llround(static_cast<double>(options.duty_period_ns) * options.duty_cycle));
+  requested_active_window_ns =
+      std::min(requested_active_window_ns,
+               static_cast<unsigned long long>(options.duty_period_ns));
+  if (!full_duty && options.duty_cycle > 0.0 &&
+      requested_active_window_ns >= options.duty_period_ns) {
+    requested_active_window_ns = options.duty_period_ns - 1;
+  }
 
   WgmmaRunResult result;
   result.instruction_n = options.instruction_n;
+  result.requested_period_ns = options.duty_period_ns;
+  result.requested_active_window_ns = requested_active_window_ns;
+  result.requested_idle_window_ns =
+      options.duty_period_ns - requested_active_window_ns;
   result.requested_duration_ms = options.steady_sec * 1000.0;
   result.grid_blocks = grid_blocks;
   result.occupancy_max_active_blocks_per_sm =
@@ -577,7 +812,11 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
 
   unsigned long long* device_counts = nullptr;
   float* device_outputs = nullptr;
+  unsigned long long* device_active_ns = nullptr;
+  unsigned long long* device_idle_ns = nullptr;
   std::vector<unsigned long long> host_counts(static_cast<std::size_t>(grid_blocks));
+  std::vector<unsigned long long> host_active_ns;
+  std::vector<unsigned long long> host_idle_ns;
   check_cuda(cudaMalloc(
                  reinterpret_cast<void**>(&device_counts),
                  host_counts.size() * sizeof(unsigned long long)),
@@ -586,18 +825,43 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
                  reinterpret_cast<void**>(&device_outputs),
                  host_counts.size() * sizeof(float)),
              "cudaMalloc(wgmma outputs)");
+  if (!full_duty) {
+    host_active_ns.resize(host_counts.size());
+    host_idle_ns.resize(host_counts.size());
+    check_cuda(cudaMalloc(
+                   reinterpret_cast<void**>(&device_active_ns),
+                   host_counts.size() * sizeof(unsigned long long)),
+               "cudaMalloc(wgmma active time)");
+    check_cuda(cudaMalloc(
+                   reinterpret_cast<void**>(&device_idle_ns),
+                   host_counts.size() * sizeof(unsigned long long)),
+               "cudaMalloc(wgmma idle time)");
+  }
 
   try {
     if (options.warmup_sec > 0.0) {
-      launch_persistent_dispatch(
-          options.instruction_n,
-          options.accumulator_sets,
-          options.wait_group,
-          grid_blocks,
-          duration_to_nanoseconds(options.warmup_sec),
-          options.ops_per_check,
-          device_counts,
-          device_outputs);
+      if (full_duty) {
+        launch_persistent_dispatch(
+            options.instruction_n,
+            options.accumulator_sets,
+            options.wait_group,
+            grid_blocks,
+            duration_to_nanoseconds(options.warmup_sec),
+            options.ops_per_check,
+            device_counts,
+            device_outputs);
+      } else {
+        launch_duty_persistent(
+            grid_blocks,
+            duration_to_nanoseconds(options.warmup_sec),
+            options.duty_period_ns,
+            requested_active_window_ns,
+            options.duty_check_ops,
+            device_counts,
+            device_outputs,
+            device_active_ns,
+            device_idle_ns);
+      }
       check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(wgmma warmup)");
     }
 
@@ -606,15 +870,28 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
     check_cuda(cudaEventCreate(&start), "cudaEventCreate(wgmma start)");
     check_cuda(cudaEventCreate(&stop), "cudaEventCreate(wgmma stop)");
     check_cuda(cudaEventRecord(start), "cudaEventRecord(wgmma start)");
-    launch_persistent_dispatch(
-        options.instruction_n,
-        options.accumulator_sets,
-        options.wait_group,
-        grid_blocks,
-        duration_to_nanoseconds(options.steady_sec),
-        options.ops_per_check,
-        device_counts,
-        device_outputs);
+    if (full_duty) {
+      launch_persistent_dispatch(
+          options.instruction_n,
+          options.accumulator_sets,
+          options.wait_group,
+          grid_blocks,
+          duration_to_nanoseconds(options.steady_sec),
+          options.ops_per_check,
+          device_counts,
+          device_outputs);
+    } else {
+      launch_duty_persistent(
+          grid_blocks,
+          duration_to_nanoseconds(options.steady_sec),
+          options.duty_period_ns,
+          requested_active_window_ns,
+          options.duty_check_ops,
+          device_counts,
+          device_outputs,
+          device_active_ns,
+          device_idle_ns);
+    }
     check_cuda(cudaEventRecord(stop), "cudaEventRecord(wgmma stop)");
     check_cuda(cudaEventSynchronize(stop), "cudaEventSynchronize(wgmma stop)");
 
@@ -634,17 +911,48 @@ WgmmaRunResult run_wgmma_persistent_sm90a(const WgmmaRunOptions& options) {
       result.wgmma_ops_executed += count;
     }
     result.actual_elapsed_ms = static_cast<double>(elapsed_ms);
+    if (full_duty) {
+      result.measured_active_ns = static_cast<unsigned long long>(
+          result.actual_elapsed_ms * 1.0e6);
+      result.measured_idle_ns = 0;
+    } else {
+      check_cuda(cudaMemcpy(
+                     host_active_ns.data(),
+                     device_active_ns,
+                     host_active_ns.size() * sizeof(unsigned long long),
+                     cudaMemcpyDeviceToHost),
+                 "cudaMemcpy(wgmma active time)");
+      check_cuda(cudaMemcpy(
+                     host_idle_ns.data(),
+                     device_idle_ns,
+                     host_idle_ns.size() * sizeof(unsigned long long),
+                     cudaMemcpyDeviceToHost),
+                 "cudaMemcpy(wgmma idle time)");
+      unsigned long long active_sum_ns = 0;
+      unsigned long long idle_sum_ns = 0;
+      for (std::size_t index = 0; index < host_active_ns.size(); ++index) {
+        active_sum_ns += host_active_ns[index];
+        idle_sum_ns += host_idle_ns[index];
+      }
+      result.measured_active_ns = active_sum_ns / host_active_ns.size();
+      result.measured_idle_ns = idle_sum_ns / host_idle_ns.size();
+    }
     result.initial_global_load_bytes = 0;
     result.steady_global_load_bytes_per_loop = 0;
-    result.final_global_store_bytes =
-        host_counts.size() * (sizeof(unsigned long long) + sizeof(float));
+    result.final_global_store_bytes = host_counts.size() *
+        (sizeof(unsigned long long) + sizeof(float) +
+         (full_duty ? 0 : 2 * sizeof(unsigned long long)));
 
     cudaFree(device_counts);
     cudaFree(device_outputs);
+    cudaFree(device_active_ns);
+    cudaFree(device_idle_ns);
     return result;
   } catch (...) {
     cudaFree(device_counts);
     cudaFree(device_outputs);
+    cudaFree(device_active_ns);
+    cudaFree(device_idle_ns);
     throw;
   }
 }

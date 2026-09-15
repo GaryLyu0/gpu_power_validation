@@ -272,6 +272,14 @@ cuobjdump --dump-sass build/workloads/tensor_core_burn | grep -E 'HGMMA\.64x(64|
 cuobjdump --dump-ptx build/workloads/tensor_core_burn | grep -E 'wgmma\\.mma_async'
 ```
 
+For temporal WGMMA power sweeps, `wgmma_persistent` keeps the validated H100
+N128/two-accumulator/wait1 compute primitive and varies only in-kernel active
+time. Use `--wgmma-duty-period-ns 1000000` and
+`--wgmma-duty-check-ops 64`; duty 1.0 preserves the original coarse full-duty
+fast path. The initial H100 matrix is duty `0.0`, `0.1`, `0.5`, `0.9`, and
+`1.0` with `active_sm_fraction=1.0`, `blocks_per_sm=2`, and an externally
+locked 1770 MHz SM clock. The benchmark does not invoke `nvidia-smi`.
+
 See [workloads/cuda_microbench/README.md](workloads/cuda_microbench/README.md)
 for full-GPU, residency, WMMA comparison, and Nsight Compute commands. WGMMA
 runtime behavior and power remain H100-side validation items.

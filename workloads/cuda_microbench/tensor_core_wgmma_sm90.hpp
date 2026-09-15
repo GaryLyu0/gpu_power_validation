@@ -14,12 +14,20 @@ struct WgmmaRunOptions {
   int ops_per_check = 512;
   int wait_group = 1;
   int accumulator_sets = 2;
+  double duty_cycle = 1.0;
+  std::uint64_t duty_period_ns = 1000000;
+  int duty_check_ops = 64;
   double warmup_sec = 0.0;
   double steady_sec = 1.0;
 };
 
 struct WgmmaRunResult {
   std::uint64_t wgmma_ops_executed = 0;
+  std::uint64_t requested_period_ns = 0;
+  std::uint64_t requested_active_window_ns = 0;
+  std::uint64_t requested_idle_window_ns = 0;
+  std::uint64_t measured_active_ns = 0;
+  std::uint64_t measured_idle_ns = 0;
   int instruction_n = 64;
   std::string timer_source = "ptx_globaltimer_ns";
   double requested_duration_ms = 0.0;

@@ -60,6 +60,8 @@ struct Options {
   int wgmma_wait_group = 1;
   int wgmma_accumulator_sets = 2;
   int wgmma_instruction_n = 64;
+  std::uint64_t wgmma_duty_period_ns = 1000000;
+  int wgmma_duty_check_ops = 64;
   int control_sleep_ns = 100000;
   std::string sparsity_mode = "none";
   double zero_ratio = 0.0;
@@ -172,6 +174,21 @@ struct Result {
   int wgmma_wait_group = 0;
   int wgmma_accumulator_sets = 0;
   int wgmma_ops_per_check = 0;
+  int wgmma_duty_check_ops = 0;
+  double requested_duty_cycle = 0.0;
+  std::uint64_t requested_period_ns = 0;
+  std::uint64_t requested_active_window_ns = 0;
+  std::uint64_t requested_idle_window_ns = 0;
+  std::uint64_t measured_active_ns = 0;
+  std::uint64_t measured_idle_ns = 0;
+  double measured_duty_cycle = 0.0;
+  double wall_tflops = 0.0;
+  double active_window_tflops = 0.0;
+  double normalized_mac_utilization = 0.0;
+  bool normalized_mac_utilization_available = false;
+  bool correctness_applicable = true;
+  bool local_memory_spill_detected = false;
+  bool resource_validation_passed = true;
   bool uses_tma = false;
   bool uses_tma_known = false;
   std::uint64_t wgmma_smem_operand_bytes_per_op = 0;
@@ -285,6 +302,25 @@ int parse_non_negative_int(const std::string& value, const std::string& name) {
   return static_cast<int>(parsed);
 }
 
+std::uint64_t parse_positive_uint64(
+    const std::string& value,
+    const std::string& name) {
+  if (value.empty() || value.front() == '-') {
+    throw std::runtime_error("Invalid " + name + ": " + value);
+  }
+  std::size_t parsed_chars = 0;
+  unsigned long long parsed = 0;
+  try {
+    parsed = std::stoull(value, &parsed_chars, 10);
+  } catch (const std::exception&) {
+    throw std::runtime_error("Invalid " + name + ": " + value);
+  }
+  if (parsed_chars != value.size() || parsed == 0) {
+    throw std::runtime_error("Invalid " + name + ": " + value);
+  }
+  return static_cast<std::uint64_t>(parsed);
+}
+
 int parse_device(const std::string& value) {
   char* end = nullptr;
   long parsed = std::strtol(value.c_str(), &end, 10);
@@ -363,6 +399,10 @@ Options parse_args(int argc, char** argv) {
       options.wgmma_accumulator_sets = parse_int(require_value(arg), arg);
     } else if (arg == "--wgmma-instruction-n") {
       options.wgmma_instruction_n = parse_int(require_value(arg), arg);
+    } else if (arg == "--wgmma-duty-period-ns") {
+      options.wgmma_duty_period_ns = parse_positive_uint64(require_value(arg), arg);
+    } else if (arg == "--wgmma-duty-check-ops") {
+      options.wgmma_duty_check_ops = parse_int(require_value(arg), arg);
     } else if (arg == "--control-sleep-ns") {
       options.control_sleep_ns = parse_int(require_value(arg), arg);
     } else if (arg == "--sparsity-mode") {
@@ -389,6 +429,7 @@ Options parse_args(int argc, char** argv) {
           << "--synthetic-mma-ops-per-loop 256 "
           << "--wgmma-ops-per-check 512 --wgmma-wait-group 1 "
           << "--wgmma-accumulator-sets 2 --wgmma-instruction-n {64,128,256} "
+          << "--wgmma-duty-period-ns 1000000 --wgmma-duty-check-ops 64 "
           << "--control-sleep-ns 100000 "
           << "--sparsity-mode none|dense_zero|structured_2to4 "
           << "--zero-ratio 0.0 --zero-pattern regular_k "
@@ -411,7 +452,12 @@ Options parse_args(int argc, char** argv) {
           << "engine=wgmma_persistent is Hopper H100/SM90a only. It launches "
           << "one 128-thread warpgroup per CTA and executes asynchronous BF16 "
           << "SM90a WGMMA from A/B tiles initialized once in shared memory. "
-          << "Phase 2 still requires --duty-cycle 1.0, uses no TMA, performs no "
+          << "The duty=1 path preserves the original coarse full-duty loop. "
+          << "For duty in [0,1), the validated N128/2-accumulator/wait1 path "
+          << "uses device-wide globaltimer phase control; --wgmma-duty-period-ns "
+          << "sets the period and --wgmma-duty-check-ops sets active chunk size. "
+          << "The idle phase fully drains WGMMA before bounded __nanosleep calls. "
+          << "The engine uses no TMA, performs no "
           << "steady-state global A/B loads, and counts FLOPs from actual "
           << "64x{64,128,256}x16 WGMMA operations selected by "
           << "--wgmma-instruction-n. --wgmma-ops-per-check sets the "
@@ -516,10 +562,13 @@ Options parse_args(int argc, char** argv) {
     throw std::runtime_error(
         "engine=wgmma_persistent phase 2 supports --sparsity-mode none only");
   }
-  if (options.engine == "wgmma_persistent" && options.duty_cycle != 1.0) {
+  if (options.engine == "wgmma_persistent" && options.duty_cycle < 1.0 &&
+      (options.wgmma_instruction_n != 128 ||
+       options.wgmma_accumulator_sets != 2 || options.wgmma_wait_group != 1)) {
     throw std::runtime_error(
-        "wgmma_persistent phase 2 currently supports duty_cycle=1.0 only; "
-        "warpgroup-uniform duty-cycle control will be implemented separately");
+        "wgmma_persistent temporal duty control requires "
+        "--wgmma-instruction-n 128 --wgmma-accumulator-sets 2 "
+        "--wgmma-wait-group 1; duty=1.0 retains all existing specializations");
   }
   if (options.engine == "wgmma_control" && options.sparsity_mode != "none") {
     throw std::runtime_error(
@@ -2053,6 +2102,9 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   run_options.ops_per_check = options.wgmma_ops_per_check;
   run_options.wait_group = options.wgmma_wait_group;
   run_options.accumulator_sets = options.wgmma_accumulator_sets;
+  run_options.duty_cycle = options.duty_cycle;
+  run_options.duty_period_ns = options.wgmma_duty_period_ns;
+  run_options.duty_check_ops = options.wgmma_duty_check_ops;
   run_options.warmup_sec = options.warmup_sec;
   run_options.steady_sec = options.steady_sec;
 
@@ -2075,7 +2127,27 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
                               : 0.0;
   result.scheduled_tflops =
       options.steady_sec > 0.0 ? total_flops / (options.steady_sec * 1.0e12) : 0.0;
-  result.duty_control_mode = "persistent_warpgroup_full_duty";
+  result.wall_tflops = result.active_tflops;
+  result.active_window_tflops = run_result.measured_active_ns > 0
+                                    ? total_flops /
+                                          (static_cast<double>(run_result.measured_active_ns) *
+                                           1.0e3)
+                                    : 0.0;
+  result.requested_duty_cycle = options.duty_cycle;
+  result.requested_period_ns = run_result.requested_period_ns;
+  result.requested_active_window_ns = run_result.requested_active_window_ns;
+  result.requested_idle_window_ns = run_result.requested_idle_window_ns;
+  result.measured_active_ns = run_result.measured_active_ns;
+  result.measured_idle_ns = run_result.measured_idle_ns;
+  const std::uint64_t measured_total_ns =
+      run_result.measured_active_ns + run_result.measured_idle_ns;
+  result.measured_duty_cycle = measured_total_ns > 0
+                                   ? static_cast<double>(run_result.measured_active_ns) /
+                                         static_cast<double>(measured_total_ns)
+                                   : 0.0;
+  result.duty_control_mode = options.duty_cycle == 1.0
+                                 ? "persistent_warpgroup_full_duty_fast_path"
+                                 : "globaltimer_periodic_wgmma_nanosleep";
   result.spatial_control_mode = "persistent_cta_count";
   result.grid_blocks = run_result.grid_blocks;
   result.blocks_per_sm = options.blocks_per_sm;
@@ -2084,6 +2156,8 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   result.effective_blocks_per_sm_estimate =
       run_result.effective_blocks_per_sm_estimate;
   result.occupancy_limited = run_result.occupancy_limited;
+  result.blocks_per_sm_resource_feasible =
+      options.blocks_per_sm <= run_result.occupancy_max_active_blocks_per_sm;
   result.registers_per_thread = run_result.registers_per_thread;
   result.local_memory_bytes_per_thread =
       static_cast<std::uint64_t>(run_result.local_memory_bytes_per_thread);
@@ -2120,6 +2194,7 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   result.uses_cutlass_mma_atom_direct = false;
   result.warpgroup_threads = 128;
   result.warps_per_warpgroup = 4;
+  result.warps_per_cta = 4;
   result.wgmma_instruction_m = 64;
   result.wgmma_instruction_n = run_result.instruction_n;
   result.wgmma_instruction_k = 16;
@@ -2128,6 +2203,7 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   result.wgmma_wait_group = options.wgmma_wait_group;
   result.wgmma_accumulator_sets = options.wgmma_accumulator_sets;
   result.wgmma_ops_per_check = options.wgmma_ops_per_check;
+  result.wgmma_duty_check_ops = options.wgmma_duty_check_ops;
   result.wgmma_smem_operand_bytes_per_op =
       (64ULL * 16ULL +
        static_cast<std::uint64_t>(run_result.instruction_n) * 16ULL) *
@@ -2142,8 +2218,15 @@ Result measure_wgmma_persistent(const Options& options, int requested_sm_count) 
   result.correctness_reference = run_result.correctness_reference;
   result.correctness_observed = run_result.correctness_observed;
   result.correctness_abs_error = run_result.correctness_abs_error;
-  result.note =
-      "wgmma_persistent phase 2 uses one 128-thread warpgroup per CTA, BF16 A/B tiles initialized once in shared memory, a compile-time-specialized instruction N dimension and independent FP32 accumulators, no TMA, no steady-state global A/B loads, no hot-loop atomics, and a coarse warpgroup-uniform timer check. wait_group is always smaller than accumulator_sets so an accumulator is not reused while its prior WGMMA group can remain pending. Requested duration uses the device-wide PTX globaltimer nanosecond timebase after in-kernel shared-memory and descriptor setup; actual_elapsed_ms comes from CUDA events and conservatively includes that small one-time startup. m/n/k are retained only for CLI compatibility and do not determine executed work. blocks_per_sm is requested launch density; CUDA block scheduling approximates active-SM coverage and does not guarantee specific SM IDs.";
+  result.local_memory_spill_detected = result.local_memory_bytes_per_thread > 0;
+  result.resource_validation_passed = !result.local_memory_spill_detected;
+  if (options.duty_cycle == 1.0) {
+    result.note =
+        "wgmma_persistent duty=1.0 preserves the validated full-duty kernel and its coarse --wgmma-ops-per-check duration checks; no duty-control timer reads or nanosleeps are added to the hot path. The engine uses one 128-thread warpgroup per CTA, BF16 A/B tiles initialized once in shared memory, compile-time-specialized instruction N and FP32 accumulator sets, no TMA, no steady-state global A/B loads, and no hot-loop atomics. active_tflops retains its historical meaning: total executed WGMMA FLOPs divided by CUDA-event wall time; wall_tflops reports the same quantity explicitly. normalized_mac_utilization is null because a measured full-duty reference from the same fixed-clock experiment is required. m/n/k remain CLI-compatible nominal values only.";
+  } else {
+    result.note =
+        "wgmma_persistent temporal duty control is frozen to the validated m64n128k16 BF16 SS WGMMA primitive with two accumulator sets and wait_group=1. Device-wide PTX globaltimer modulo the requested period aligns CTA phases; active work is checked every --wgmma-duty-check-ops operations, fully drained with wait_group<0> before idle, and idle uses bounded __nanosleep without busy spinning. duty=0 remains this WGMMA kernel/resource family but issues zero WGMMA operations. measured_active_ns and measured_idle_ns are per-CTA averages. active_tflops retains its historical wall-time definition; wall_tflops is the explicit wall-time metric and active_window_tflops uses measured per-CTA active time. normalized_mac_utilization is null because it requires a measured full-duty reference from the same fixed-clock experiment. There are no steady-state global A/B loads, TMA operations, or hot-loop global counters.";
+  }
   return result;
 }
 #else
@@ -2170,6 +2253,10 @@ Result measure_wgmma_control(const Options& options, int requested_sm_count) {
   result.m = 0;
   result.n = 0;
   result.k = 0;
+  result.logical_m = 0;
+  result.logical_n = 0;
+  result.logical_k = 0;
+  result.correctness_applicable = false;
   result.active_elapsed_ms = run_result.actual_elapsed_ms;
   result.actual_elapsed_ms = run_result.actual_elapsed_ms;
   result.timer_source = run_result.timer_source;
@@ -2320,6 +2407,8 @@ void print_json(const Result& result) {
             << (result.uses_sparse_tensor_core ? "true" : "false") << ","
             << "\"dense_mma_instruction_count_unchanged\":"
             << (result.dense_mma_instruction_count_unchanged ? "true" : "false") << ","
+            << "\"correctness_applicable\":"
+            << (result.correctness_applicable ? "true" : "false") << ","
             << "\"correctness_smoke_passed\":"
             << (result.correctness_smoke_passed ? "true" : "false") << ","
             << "\"correctness_reference\":" << result.correctness_reference << ","
@@ -2386,8 +2475,33 @@ void print_json(const Result& result) {
             << "\"wgmma_wait_group\":" << result.wgmma_wait_group << ","
             << "\"wgmma_accumulator_sets\":" << result.wgmma_accumulator_sets << ","
             << "\"wgmma_ops_per_check\":" << result.wgmma_ops_per_check << ","
+            << "\"wgmma_duty_check_ops\":" << result.wgmma_duty_check_ops << ","
+            << "\"requested_duty_cycle\":" << result.requested_duty_cycle << ","
+            << "\"requested_period_ns\":" << result.requested_period_ns << ","
+            << "\"requested_active_window_ns\":"
+            << result.requested_active_window_ns << ","
+            << "\"requested_idle_window_ns\":"
+            << result.requested_idle_window_ns << ","
+            << "\"measured_active_ns\":" << result.measured_active_ns << ","
+            << "\"measured_idle_ns\":" << result.measured_idle_ns << ","
+            << "\"measured_duty_cycle\":" << result.measured_duty_cycle << ","
+            << "\"wall_tflops\":" << result.wall_tflops << ","
+            << "\"active_window_tflops\":" << result.active_window_tflops << ","
+            << "\"local_memory_spill_detected\":"
+            << (result.local_memory_spill_detected ? "true" : "false") << ","
+            << "\"resource_validation_passed\":"
+            << (result.resource_validation_passed ? "true" : "false") << ","
             << "\"wgmma_smem_operand_bytes_per_op\":"
             << result.wgmma_smem_operand_bytes_per_op << ","
+            << "\"normalized_mac_utilization\":";
+  if (result.normalized_mac_utilization_available) {
+    std::cout << result.normalized_mac_utilization;
+  } else {
+    std::cout << "null";
+  }
+  std::cout << ","
+            << "\"normalized_mac_utilization_available\":"
+            << (result.normalized_mac_utilization_available ? "true" : "false") << ","
             << "\"uses_tma\":"
             << (result.uses_tma_known
                     ? (result.uses_tma ? "true" : "false")

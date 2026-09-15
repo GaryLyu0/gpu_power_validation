@@ -350,6 +350,70 @@ ncu --set full --target-processes all -o results/ncu_wgmma_control \
   --control-sleep-ns 100000 --warmup-sec 1 --steady-sec 5
 ```
 
+### Hopper WGMMA temporal duty validation
+
+`wgmma_persistent` supports an in-kernel temporal duty schedule for the frozen
+H100 `m64n128k16` BF16 SS WGMMA configuration with two accumulator sets and
+`wait_group=1`. The active phase uses the same WGMMA issue primitive as the
+validated full-compute workload. Before every idle phase it drains all pending
+WGMMA groups, then sleeps in bounded `__nanosleep()` chunks. `%globaltimer`
+modulo the requested period provides a common device-wide phase without a
+global barrier or hot-loop atomics.
+
+`--wgmma-duty-period-ns` defaults to 1 ms and
+`--wgmma-duty-check-ops` defaults to 64. The latter controls active-phase timer
+granularity only. At `--duty-cycle 1.0`, the original full-duty kernel remains
+the selected fast path and continues to use `--wgmma-ops-per-check` (2048 in
+the validated setup); it performs no duty-control nanosleep or fine timer
+checks. At duty zero, the duty-controlled WGMMA kernel and its shared-memory
+and accumulator resource shape remain resident, but it issues zero WGMMA ops.
+
+Run the initial fixed-shape matrix on H100 after externally locking the selected
+GPU's SM clock to 1770 MHz. The benchmark itself does not call `nvidia-smi`:
+
+```bash
+GPU=0
+for duty in 0.0 0.1 0.5 0.9 1.0; do
+  ./build/workloads/tensor_core_burn \
+    --device "${GPU}" --dtype bf16 --engine wgmma_persistent \
+    --m 64 --n 128 --k 16 \
+    --duty-cycle "${duty}" --active-sm-fraction 1.0 --blocks-per-sm 2 \
+    --wgmma-instruction-n 128 --wgmma-accumulator-sets 2 \
+    --wgmma-wait-group 1 --wgmma-ops-per-check 2048 \
+    --wgmma-duty-period-ns 1000000 --wgmma-duty-check-ops 64 \
+    --sparsity-mode none --warmup-sec 3 --steady-sec 10
+done
+```
+
+The JSON distinguishes requested and measured active/idle time and reports
+`wall_tflops` separately from `active_window_tflops`. The legacy
+`active_tflops` field retains its prior wall-time definition. Measured active
+and idle nanoseconds are averages of the final per-CTA counters. A single run does
+not have a same-condition full-duty reference, so
+`normalized_mac_utilization` is `null`; compute it afterward as measured
+`wall_tflops / full-duty wall_tflops` from the same fixed-clock experiment.
+
+After building for H100, confirm the active path remains
+`HGMMA.64x128x16.F32.BF16`, the controlled specialization contains
+`NANOSLEEP`, no TMA instructions appear, occupancy still permits two CTAs/SM,
+and `local_memory_bytes_per_thread=0`. Treat
+`resource_validation_passed=false` as a failed resource check:
+
+```bash
+cuobjdump --dump-sass build/workloads/tensor_core_burn | \
+  grep -E 'HGMMA\.64x128x16\.F32\.BF16|NANOSLEEP|TMA'
+
+ncu --set full --target-processes all -o results/ncu_wgmma_duty50 \
+  ./build/workloads/tensor_core_burn \
+  --device 0 --dtype bf16 --engine wgmma_persistent \
+  --m 64 --n 128 --k 16 --duty-cycle 0.5 \
+  --active-sm-fraction 1.0 --blocks-per-sm 2 \
+  --wgmma-instruction-n 128 --wgmma-accumulator-sets 2 \
+  --wgmma-wait-group 1 --wgmma-ops-per-check 2048 \
+  --wgmma-duty-period-ns 1000000 --wgmma-duty-check-ops 64 \
+  --warmup-sec 1 --steady-sec 5
+```
+
 `cutlass_tile_burn` cap validation examples:
 
 ```bash
